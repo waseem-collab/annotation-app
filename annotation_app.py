@@ -352,6 +352,29 @@ def _build_update_zip(lbl_dir, classes, frames, subset, zip_path):
         z.writestr(listname, "\n".join(lines) + "\n")
 
 
+def _cvat_mark_deleted_frames(task_id, frame_paths):
+    """Mark frames as deleted on a CVAT task (by matching their name/basename).
+    Returns how many new frames were marked."""
+    s = _cvat_session()
+    meta = s.get(f"{CVAT_URL}/api/tasks/{task_id}/data/meta").json()
+    frames = meta.get("frames", [])
+    name_to_idx = {f.get("name"): i for i, f in enumerate(frames)}
+    base_to_idx = {os.path.basename(f.get("name", "")): i for i, f in enumerate(frames)}
+    existing = set(meta.get("deleted_frames") or [])
+    new = set()
+    for fp in frame_paths:
+        idx = name_to_idx.get(fp)
+        if idx is None:
+            idx = base_to_idx.get(os.path.basename(fp))
+        if idx is not None:
+            new.add(idx)
+    fresh = new - existing
+    if fresh:
+        s.patch(f"{CVAT_URL}/api/tasks/{task_id}/data/meta",
+                json={"deleted_frames": sorted(existing | new)})
+    return len(fresh)
+
+
 def _cvat_import_annotations(client, task_id, zip_path):
     """Upload annotations to an existing task via TUS with location=local (needed
     when the task's storage is cloud-backed). Replicates the SDK uploader but
@@ -395,18 +418,29 @@ def _do_cvat_upload(project_id, task_name, task_id, frames, subset,
             if not classes:
                 raise RuntimeError("no labels.txt/classes to upload")
             fmap = frames if frames else {n: n for n in images}
+            # images the user deleted locally -> delete those frames in CVAT too
+            present = set(os.listdir(img_dir)) if os.path.isdir(img_dir) else set()
+            deleted_paths = [fp for base, fp in fmap.items() if base not in present]
+            remaining = {b: fp for b, fp in fmap.items() if b in present}
+            ndel = 0
+            if deleted_paths:
+                _set_job(state="uploading",
+                         message=f"removing {len(deleted_paths)} deleted frame(s) from task {task_id}…")
+                ndel = _cvat_mark_deleted_frames(task_id, deleted_paths)
             fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_upd_")
             os.close(fd)
-            _build_update_zip(lbl_dir, classes, fmap, subset, zip_path)
+            _build_update_zip(lbl_dir, classes, remaining, subset, zip_path)
             _set_job(state="uploading",
                      message=f"updating annotations on task {task_id}…")
             with _cvat_client() as client:
                 task = client.tasks.retrieve(int(task_id))
                 task.remove_annotations()                 # clean replace
                 _cvat_import_annotations(client, int(task_id), zip_path)
+            msg = f"updated task {task_id} ✓"
+            if ndel:
+                msg += f" ({ndel} frame(s) deleted)"
             _set_job(state="done", running=False, task_id=int(task_id),
-                     task_url=f"{CVAT_URL}/tasks/{task_id}",
-                     message=f"updated task {task_id} ✓")
+                     task_url=f"{CVAT_URL}/tasks/{task_id}", message=msg)
             return
 
         # ---- create a NEW task ----
@@ -445,15 +479,55 @@ def _do_cvat_upload(project_id, task_name, task_id, frames, subset,
                 pass
 
 
+# Cached project/task lists (persisted to disk so they survive restarts; the UI
+# has Refresh buttons to re-fetch when CVAT changes).
+_CVAT_CACHE_FILE = os.path.join(BASE, ".cvat_cache.json")
+_cvat_cache = {"projects": None, "tasks": {}}
+_cvat_cache_lock = threading.Lock()
+
+
+def _load_cvat_cache():
+    global _cvat_cache
+    try:
+        with open(_CVAT_CACHE_FILE) as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            _cvat_cache = {"projects": d.get("projects"), "tasks": d.get("tasks") or {}}
+    except (OSError, ValueError):
+        pass
+
+
+def _save_cvat_cache():
+    try:
+        with open(_CVAT_CACHE_FILE, "w") as fh:
+            json.dump(_cvat_cache, fh)
+    except OSError:
+        pass
+
+
+_load_cvat_cache()
+
+
 @app.route("/api/cvat/projects")
 def api_cvat_projects():
-    """List CVAT projects (id + name) in the configured org, for the dropdown."""
+    """List CVAT projects (id + name). Served from cache unless ?refresh=1."""
+    refresh = request.args.get("refresh") == "1"
+    with _cvat_cache_lock:
+        cached = _cvat_cache.get("projects")
+    if not refresh and cached is not None:
+        return jsonify({"projects": cached, "org": CVAT_ORG, "url": CVAT_URL, "cached": True})
     try:
         with _cvat_client() as client:
             projects = [{"id": p.id, "name": p.name} for p in client.projects.list()]
-        projects.sort(key=lambda p: p["id"])
+        projects.sort(key=lambda p: p["id"], reverse=True)   # newest first
+        with _cvat_cache_lock:
+            _cvat_cache["projects"] = projects
+            _save_cvat_cache()
         return jsonify({"projects": projects, "org": CVAT_ORG, "url": CVAT_URL})
     except Exception as e:
+        if cached is not None:                    # fall back to cache on error
+            return jsonify({"projects": cached, "org": CVAT_ORG, "url": CVAT_URL,
+                            "cached": True, "warn": str(e)})
         return jsonify({"error": str(e)}), 500
 
 
@@ -548,14 +622,26 @@ def _cvat_list_tasks(project_id):
 
 @app.route("/api/cvat/tasks")
 def api_cvat_tasks():
+    """Tasks for a project. Served from cache unless ?refresh=1."""
     pid = request.args.get("project_id")
     if not pid:
         return jsonify({"error": "no project id"}), 400
+    refresh = request.args.get("refresh") == "1"
+    key = str(pid)
+    with _cvat_cache_lock:
+        cached = _cvat_cache["tasks"].get(key)
+    if not refresh and cached is not None:
+        return jsonify({"tasks": cached, "cached": True})
     try:
         tasks = _cvat_list_tasks(pid)
-        tasks.sort(key=lambda t: t["id"])
+        tasks.sort(key=lambda t: t["id"], reverse=True)   # newest first
+        with _cvat_cache_lock:
+            _cvat_cache["tasks"][key] = tasks
+            _save_cvat_cache()
         return jsonify({"tasks": tasks})
     except Exception as e:
+        if cached is not None:
+            return jsonify({"tasks": cached, "cached": True, "warn": str(e)})
         return jsonify({"error": str(e)}), 500
 
 
@@ -681,27 +767,31 @@ def _cvat_export_task(session, task_id, zip_path):
     raise RuntimeError("export timed out")
 
 
-def _do_cvat_import(task_id):
+def _cvat_import_task(task_id, status=None):
+    """Download a task as YOLO+images into imports/<id>_<name>/, write the link
+    file, and return {out_dir, count, classes, frames, subset, name, project_id}.
+    `status` is an optional callable(message) for progress."""
     import tempfile
     import shutil
+    def say(m):
+        if status:
+            status(m)
     zip_path = None
     try:
-        _set_imp(state="exporting", message="connecting to CVAT…")
+        say("connecting to CVAT…")
         session = _cvat_session()
         info = session.get(f"{CVAT_URL}/api/tasks/{task_id}").json()
         tname = info.get("name") or f"task_{task_id}"
         fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_task_")
         os.close(fd)
-        _set_imp(message=f"exporting '{tname}' (images + annotations)…")
+        say(f"exporting '{tname}' (images + annotations)…")
         _cvat_export_task(session, task_id, zip_path)
         out_dir = os.path.join(IMPORTS_DIR, f"{task_id}_{_safe_name(tname)}")
         if os.path.isdir(out_dir):
             shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir, exist_ok=True)
-        _set_imp(message="extracting…")
+        say("extracting…")
         n, names, frames, subset = _extract_yolo_export(zip_path, out_dir)
-        # remember which CVAT task this folder came from (plus the frame paths /
-        # subset) so uploading can update the SAME task's annotations.
         try:
             with open(os.path.join(out_dir, ".cvat_task.json"), "w") as fh:
                 json.dump({"task_id": int(task_id), "task_name": tname,
@@ -709,17 +799,25 @@ def _do_cvat_import(task_id):
                            "frames": frames, "subset": subset}, fh)
         except OSError:
             pass
-        _set_imp(running=False, state="done", path=out_dir, count=n,
-                 message=f"imported {n} images, {len(names)} classes ✓")
-    except Exception as e:
-        _set_imp(running=False, state="error", error=str(e),
-                 message=f"import failed: {e}")
+        return {"out_dir": out_dir, "count": n, "classes": names, "frames": frames,
+                "subset": subset, "name": tname, "project_id": info.get("project_id")}
     finally:
         if zip_path and os.path.exists(zip_path):
             try:
                 os.remove(zip_path)
             except OSError:
                 pass
+
+
+def _do_cvat_import(task_id):
+    try:
+        _set_imp(state="exporting", message="connecting to CVAT…")
+        r = _cvat_import_task(task_id, status=lambda m: _set_imp(message=m))
+        _set_imp(running=False, state="done", path=r["out_dir"], count=r["count"],
+                 message=f"imported {r['count']} images, {len(r['classes'])} classes ✓")
+    except Exception as e:
+        _set_imp(running=False, state="error", error=str(e),
+                 message=f"import failed: {e}")
 
 
 @app.route("/api/cvat/import", methods=["POST"])
@@ -743,6 +841,128 @@ def api_cvat_import():
 def api_cvat_importstatus():
     with _imp_lock:
         return jsonify(dict(_imp_job))
+
+
+# --------------------------------------------------------------------------- #
+# Auto-annotation pipeline: import task -> run model -> update CVAT
+# --------------------------------------------------------------------------- #
+_ap_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
+           "task_id": None, "task_url": None, "added": 0, "error": None}
+_ap_lock = threading.Lock()
+
+
+def _set_ap(**kw):
+    with _ap_lock:
+        _ap_job.update(kw)
+
+
+def _do_cvat_autopipeline(task_id, model_path, conf, mode, name_mapping):
+    import tempfile
+    zip_path = None
+    try:
+        # 1) import the task locally
+        _set_ap(state="importing", message="importing task…")
+        r = _cvat_import_task(task_id, status=lambda m: _set_ap(message="import: " + m))
+        out_dir = r["out_dir"]
+        classes = r["classes"]
+        frames = r["frames"]
+        subset = r["subset"]
+        img_dir = os.path.join(out_dir, "images")
+        lbl_dir = os.path.join(out_dir, "labels")
+        images = sorted(os.listdir(img_dir)) if os.path.isdir(img_dir) else []
+        if not classes:
+            raise RuntimeError("task has no classes (labels.txt)")
+        # resolve model class index -> here class index (mapping value = class name)
+        name_to_idx = {str(n).strip().lower(): i for i, n in enumerate(classes)}
+        idx_map = {}
+        for k, v in (name_mapping or {}).items():
+            try:
+                mi = int(k)
+            except (TypeError, ValueError):
+                continue
+            ti = name_to_idx.get(str(v).strip().lower())
+            if ti is not None:
+                idx_map[mi] = ti
+        # 2) run the model over every image
+        _set_ap(state="annotating", message="loading model…", total=len(images))
+        _load_model(model_path)
+        added = 0
+        for i, img in enumerate(images):
+            _set_ap(message=f"annotating {i+1}/{len(images)}…", done=i)
+            lbl_path = os.path.join(lbl_dir, os.path.splitext(img)[0] + ".txt")
+            has_existing = os.path.exists(lbl_path) and os.path.getsize(lbl_path) > 0
+            if mode == "skip" and has_existing:
+                continue
+            try:
+                dets, _ = _infer(model_path, os.path.join(img_dir, img), conf)
+            except Exception:
+                continue
+            new_boxes = []
+            for d in dets:
+                ci = idx_map.get(d.get("cls_model"))
+                if ci is None:
+                    continue
+                new_boxes.append({"cls": ci, "cx": d["cx"], "cy": d["cy"],
+                                  "w": d["w"], "h": d["h"]})
+            boxes = (_read_label_file(lbl_path) + new_boxes) if mode == "append" else new_boxes
+            _write_label_file(lbl_path, boxes)
+            added += len(new_boxes)
+        # 3) push the annotations back to the CVAT task
+        _set_ap(state="uploading", message=f"updating CVAT task {task_id}…", done=len(images))
+        fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_ap_")
+        os.close(fd)
+        fmap = frames if frames else {n: n for n in images}
+        _build_update_zip(lbl_dir, classes, fmap, subset, zip_path)
+        with _cvat_client() as client:
+            task = client.tasks.retrieve(int(task_id))
+            task.remove_annotations()
+            _cvat_import_annotations(client, int(task_id), zip_path)
+        _set_ap(running=False, state="done", task_id=int(task_id), added=added,
+                task_url=f"{CVAT_URL}/tasks/{task_id}",
+                message=f"done ✓ added {added} boxes, updated task {task_id}")
+    except Exception as e:
+        _set_ap(running=False, state="error", error=str(e), message=f"failed: {e}")
+    finally:
+        if zip_path and os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+
+@app.route("/api/cvat/autopipeline", methods=["POST"])
+def api_cvat_autopipeline():
+    data = request.get_json(force=True)
+    task_id = data.get("task_id")
+    model_path = _safe_model_path(data.get("model", ""))
+    if not task_id:
+        return jsonify({"error": "no task selected"}), 400
+    if not model_path:
+        return jsonify({"error": "invalid model"}), 400
+    try:
+        conf = float(data.get("conf", 0.25) or 0.25)
+    except (TypeError, ValueError):
+        conf = 0.25
+    mode = data.get("mode")
+    if mode not in ("skip", "append", "replace"):
+        mode = "append"
+    mapping = data.get("mapping")
+    if not isinstance(mapping, dict) or not mapping:
+        return jsonify({"error": "map at least one class"}), 400
+    with _ap_lock:
+        if _ap_job["running"]:
+            return jsonify({"error": "a pipeline run is already going"}), 409
+        _ap_job.update(running=True, state="starting", message="starting…", done=0,
+                       total=0, task_id=None, task_url=None, added=0, error=None)
+    args = (task_id, model_path, conf, mode, mapping)
+    threading.Thread(target=_do_cvat_autopipeline, args=args, daemon=True).start()
+    return jsonify({"started": True})
+
+
+@app.route("/api/cvat/autopipeline_status")
+def api_cvat_autopipeline_status():
+    with _ap_lock:
+        return jsonify(dict(_ap_job))
 
 
 # --------------------------------------------------------------------------- #
@@ -1006,6 +1226,12 @@ HTML = r"""<!DOCTYPE html>
   #scrub{flex:1;min-width:120px;cursor:pointer;accent-color:#49a05f;height:6px;}
   #navpos{font-family:monospace;font-size:13px;color:#bbb;white-space:nowrap;
           min-width:92px;text-align:center;}
+  #topnav .brand{font-weight:700;font-size:14px;color:#cfe8ff;letter-spacing:.3px;
+                 white-space:nowrap;margin-right:2px;}
+  .mode{font-size:11px;padding:2px 9px;border-radius:11px;white-space:nowrap;
+        font-weight:600;letter-spacing:.3px;}
+  .mode.local{background:#2a3a2a;color:#9af2b5;border:1px solid #3a6a3a;}
+  .mode.cvat{background:#21303b;color:#7fd1ff;border:1px solid #3a6a8a;}
   #meta{display:flex;gap:16px;align-items:center;padding:4px 12px;
         background:#242424;border-bottom:1px solid #000;flex:none;}
   #status{font-size:13px;color:#9c9;}
@@ -1106,6 +1332,11 @@ HTML = r"""<!DOCTYPE html>
   #aacfg{display:flex;flex-direction:column;gap:6px;}
   .modal select,.modal input[type=number]{padding:7px;background:#1b1b1b;color:#eee;
          border:1px solid #555;border-radius:5px;font-size:13px;width:100%;box-sizing:border-box;}
+  .modal .selrow{display:flex;gap:6px;align-items:center;}
+  .modal .selrow select{flex:1;min-width:0;}
+  .modal .selrow button{flex:none;width:34px;padding:7px 0;background:#3a3a3a;color:#eee;
+         border:1px solid #555;border-radius:5px;cursor:pointer;font-size:14px;}
+  .modal .selrow button:hover{background:#474747;}
   .modal-f{padding:12px 16px;border-top:1px solid #000;display:flex;
            justify-content:flex-end;gap:8px;}
   .modal-f button{padding:7px 16px;border-radius:5px;border:1px solid #555;
@@ -1142,9 +1373,35 @@ HTML = r"""<!DOCTYPE html>
   .home-card:hover{transform:translateY(-3px);border-color:#49a05f;background:#262b27;}
   .hc-icon{color:#7fd1ff;margin-bottom:14px;}
   .home-card.cvat .hc-icon{color:#9af2b5;}
+  .home-card.auto .hc-icon{color:#ffd24d;}
   .hc-title{font-size:18px;font-weight:600;color:#eee;margin-bottom:8px;}
   .hc-desc{font-size:13px;color:#9ab;line-height:1.5;}
   #homeBtn{font-size:16px;line-height:1;padding:6px 10px;}
+  /* CVAT browser (project/task cards) */
+  .browse{position:fixed;inset:0;z-index:190;background:#161616;display:none;flex-direction:column;}
+  .browse-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;
+              background:#1f1f1f;border-bottom:1px solid #000;flex:none;}
+  .browse-bar .spacer{flex:1;}
+  .browse-bar button{background:#3a3a3a;color:#eee;border:1px solid #555;padding:6px 12px;
+              border-radius:5px;cursor:pointer;font-size:13px;}
+  .browse-bar button:hover{background:#4a4a4a;}
+  .browse-title{font-size:15px;font-weight:600;color:#cfe8ff;}
+  .browse-grid{flex:1;overflow:auto;display:grid;align-content:start;gap:14px;padding:18px;
+               grid-template-columns:repeat(auto-fill,minmax(230px,1fr));}
+  .browse-empty{color:#889;padding:20px;font-size:14px;}
+  .bcard{background:#222;border:1px solid #333;border-radius:12px;padding:18px;cursor:pointer;
+         transition:transform .1s,border-color .1s,background .1s;}
+  .bcard:hover{transform:translateY(-2px);border-color:#7fd1ff;background:#23292e;}
+  .bcard .bc-id{font-family:monospace;font-size:12px;color:#7fae8a;}
+  .bcard .bc-name{font-size:15px;font-weight:600;color:#eee;margin:5px 0;word-break:break-word;}
+  .bcard .bc-sub{font-size:12px;color:#8ab;}
+  .browse-prog{position:absolute;inset:0;background:rgba(0,0,0,.6);display:flex;
+               align-items:center;justify-content:center;}
+  .bp-card{background:#222;border:1px solid #333;border-radius:12px;padding:24px;
+           width:380px;max-width:90vw;text-align:center;}
+  #browseProgText{font-size:13px;color:#cde;margin:10px 0 14px;}
+  .bp-close{background:#3a3a3a;color:#eee;border:1px solid #555;padding:6px 16px;
+            border-radius:5px;cursor:pointer;font-size:13px;}
 </style>
 </head>
 <body>
@@ -1163,11 +1420,18 @@ HTML = r"""<!DOCTYPE html>
         <div class="hc-title">Import from CVAT</div>
         <div class="hc-desc">Pull a task's images + annotations from CVAT and edit them here.</div>
       </div>
+      <div class="home-card auto" onclick="enterAuto()">
+        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" width="44" height="44" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.1 4.1.6-3 2.9.7 4.4L12 17l-3.7 2 .7-4.4-3-2.9 4.1-.6z"/><path d="M5 21h14"/></svg></div>
+        <div class="hc-title">Automatic annotations</div>
+        <div class="hc-desc">Pick a CVAT project + task, run a model on it, and push the annotations back to CVAT.</div>
+      </div>
     </div>
   </div>
 </div>
 <div id="topnav">
   <button id="homeBtn" onclick="goHome()" title="home">&#8962;</button>
+  <span class="brand">Annotation&nbsp;Studio</span>
+  <span id="modebadge" class="mode local">Local</span>
   <button onclick="go(-1)" title="prev (A)">&#9664; Prev</button>
   <button onclick="go(1)" title="next (D)">Next &#9654;</button>
   <input id="scrub" type="range" min="0" max="0" value="0"
@@ -1209,14 +1473,14 @@ HTML = r"""<!DOCTYPE html>
       <h4>Automatic annotation</h4>
       <button class="wide ok" onclick="openAaModal()">Automatic annotation…</button>
     </div>
-    <div class="lp-sec">
+    <div class="lp-sec" id="cvatsec">
       <h4>CVAT project</h4>
       <div class="lp-row">
         <select id="cvatproj" onchange="onCvatProjPick()"><option value="">— loading projects… —</option></select>
         <button id="cvatlock" class="lockbtn" title="lock project" onclick="toggleCvatLock()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.5"/></svg></button>
       </div>
-      <button class="wide" onclick="loadCvatProjects()">Refresh list</button>
-      <button class="wide" onclick="openImpModal()">Import from CVAT…</button>
+      <button class="wide" onclick="loadCvatProjects(true)">Refresh list</button>
+      <button class="wide" onclick="openCvatBrowse()">Import from CVAT…</button>
       <button class="wide ok" onclick="openCvModal()">Upload to CVAT…</button>
       <div id="cvatstatus"></div>
     </div>
@@ -1316,25 +1580,65 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div id="impmodal" class="modal-bg">
+<div id="cvatbrowse" class="browse">
+  <div class="browse-bar">
+    <button onclick="goHome()" title="home">&#8962;</button>
+    <button id="browseBack" onclick="browseProjects()" style="display:none;">&larr; Projects</button>
+    <span id="browseTitle" class="browse-title">Import from CVAT — projects</span>
+    <span class="spacer"></span>
+    <button onclick="browseRefresh()" title="refresh">&#8635; Refresh</button>
+  </div>
+  <div id="browseGrid" class="browse-grid"></div>
+  <div id="browseProg" class="browse-prog" style="display:none;">
+    <div class="bp-card">
+      <div class="bar indet"><div></div></div>
+      <div id="browseProgText"></div>
+      <button class="bp-close" onclick="browseCancelProg()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="apmodal" class="modal-bg">
   <div class="modal">
-    <div class="modal-h">Import from CVAT</div>
+    <div class="modal-h">Automatic annotations &rarr; CVAT</div>
     <div class="modal-body">
-      <div id="impcfg">
+      <div id="apcfg">
         <label>Project</label>
-        <select id="impproj" onchange="loadImpTasks()"><option value="">— select project —</option></select>
+        <div class="selrow">
+          <select id="approj" onchange="loadApTasks()"><option value="">— select project —</option></select>
+          <button onclick="loadApProjects(true)" title="refresh projects">&#8635;</button>
+        </div>
         <label>Task</label>
-        <select id="imptask"><option value="">— select a project first —</option></select>
+        <div class="selrow">
+          <select id="aptask"><option value="">— select a project first —</option></select>
+          <button onclick="loadApTasks(true)" title="refresh tasks">&#8635;</button>
+        </div>
+        <label>Model</label>
+        <select id="apmodel"><option value="">— loading models… —</option></select>
+        <label>Confidence</label>
+        <input id="apconf" type="number" min="0" max="1" step="0.05" value="0.25">
+        <label>Existing annotations</label>
+        <select id="apmode">
+          <option value="append">add detections to them</option>
+          <option value="replace">replace them</option>
+          <option value="skip">skip already-labelled</option>
+        </select>
       </div>
-      <div id="impprog" style="display:none;">
-        <div class="bar indet" id="impbarwrap"><div id="impbar"></div></div>
-        <div id="impprogtext"></div>
+      <div id="apmap" style="display:none;">
+        <div class="maphint">Map each <b>model class</b> &rarr; a project class (auto-matched by name):</div>
+        <div id="apmaplist"></div>
       </div>
-      <div id="impmsg" class="aamsg"></div>
+      <div id="approg" style="display:none;">
+        <div class="bar" id="apbarwrap"><div id="apbar"></div></div>
+        <div id="approgtext"></div>
+      </div>
+      <div id="apmsg" class="aamsg"></div>
     </div>
     <div class="modal-f">
-      <button id="impcancel" onclick="closeImpModal()">Cancel</button>
-      <button id="imprun" class="ok" onclick="runCvatImport()">Import</button>
+      <button id="apcancel" onclick="closeApModal()">Cancel</button>
+      <button id="apback" onclick="apShowConfig()" style="display:none;">Back</button>
+      <button id="apnext" class="ok" onclick="apNext()">Next</button>
+      <button id="aprun" class="ok" onclick="runAutoPipeline()" style="display:none;">Run</button>
     </div>
   </div>
 </div>
@@ -1372,7 +1676,7 @@ function markDirty(d){ dirty=d;
   document.getElementById('name').className = d ? 'dirty' : ''; }
 function updateName(){
   document.getElementById('name').textContent = '['+(idx+1)+'/'+count+'] '+name;
-  updateNav();
+  updateNav(); updateModeBadge();
 }
 // keep the top scrubber + position label in sync with the current image
 function updateNav(){
@@ -1550,16 +1854,38 @@ function removeBox(i){
   touched=true; markDirty(true); draw(); maybeAutosave();
 }
 
-// ---- landing screen ----
-function enterLocal(){ document.getElementById('home').style.display='none';
-  if(img.complete && img.naturalWidth){ fit(); draw(); } }
-function enterImport(){ document.getElementById('home').style.display='none'; openImpModal(); }
+// ---- landing screen + mode ----
+let appMode='local';   // 'local' = no CVAT options, 'cvat' = import/upload available
+function applyMode(){
+  document.getElementById('cvatsec').style.display = appMode==='cvat' ? 'block' : 'none';
+  updateModeBadge();
+}
+function updateModeBadge(){
+  const el=document.getElementById('modebadge'); if(!el) return;
+  if(appMode==='cvat' && linkedTask){
+    el.textContent='CVAT task #'+linkedTask.task_id; el.className='mode cvat';
+  } else if(appMode==='cvat'){
+    el.textContent='CVAT'; el.className='mode cvat';
+  } else { el.textContent='Local'; el.className='mode local'; }
+}
+function enterLocal(){
+  appMode='local'; applyMode();
+  document.getElementById('home').style.display='none';
+  if(img.complete && img.naturalWidth){ fit(); draw(); }
+}
+function enterImport(){
+  appMode='cvat'; applyMode();
+  document.getElementById('home').style.display='none';
+  openCvatBrowse();
+}
 function goHome(){ document.getElementById('home').style.display='flex'; }
 
 // delete the current image (and its label) from disk, then advance
 async function deleteImage(){
   if(!count){ setStatus('no image to delete'); return; }
-  if(!confirm('Delete image "'+name+'" and its label from disk?\\nThis cannot be undone.')) return;
+  const extra = (appMode==='cvat' && linkedTask)
+    ? '\\nIt will also be removed from the CVAT task on the next update.' : '';
+  if(!confirm('Delete image "'+name+'" and its label from disk?\\nThis cannot be undone.'+extra)) return;
   const di=idx;
   touched=false; markDirty(false);     // don't autosave the image we're deleting
   try{
@@ -1739,18 +2065,18 @@ function setAaMsg(t){ const e=document.getElementById('aamsg'); if(e) e.textCont
 function aaProgText(t){ const e=document.getElementById('aaprogtext'); if(e) e.textContent=t||''; }
 function setBar(pct){ const e=document.getElementById('aabar');
   if(e) e.style.width=Math.max(0,Math.min(100,pct))+'%'; }
-async function loadModels(){
-  const sel=document.getElementById('aamodel');
+async function loadModelsInto(selId){
+  const sel=document.getElementById(selId);
   sel.innerHTML='<option value="">loading…</option>';
   try{
     const r=await fetch('/api/models?t='+Date.now()).then(r=>r.json());
-    if(!r.models.length){ sel.innerHTML='<option value="">no .pt models found</option>';
-      setAaMsg('no models in '+(r.dir||'models/')); return; }
+    if(!r.models.length){ sel.innerHTML='<option value="">no .pt models found</option>'; return; }
     sel.innerHTML='<option value="">— select model —</option>'
       +r.models.map(m=>'<option value="'+escapeHtml(m.path)+'">'+escapeHtml(m.name)
       +'</option>').join('');
-  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; setAaMsg('model list failed'); }
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; }
 }
+async function loadModels(){ return loadModelsInto('aamodel'); }
 // three views: config -> map -> progress, with matching footer buttons
 function aaButtons(cancel,back,next,run){
   document.getElementById('aacancel').style.display=cancel?'':'none';
@@ -1873,13 +2199,13 @@ function toggleCvatLock(){
   b.title=cvatLocked?'unlock project':'lock project';
   setCvatStatus(cvatLocked?('locked to project '+sel.value):'project unlocked');
 }
-async function loadCvatProjects(){
+async function loadCvatProjects(refresh){
   const sel=document.getElementById('cvatproj');
   const prev=sel.value;                       // keep current pick across a refresh
   sel.innerHTML='<option value="">loading…</option>';
-  setCvatStatus('fetching projects…');
+  setCvatStatus(refresh?'refreshing projects…':'loading projects…');
   try{
-    const r=await fetch('/api/cvat/projects?t='+Date.now()).then(r=>r.json());
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
     if(r.error){ sel.innerHTML='<option value="">— error —</option>';
       setCvatStatus('error: '+r.error); return; }
     if(!r.projects.length){ sel.innerHTML='<option value="">no projects</option>';
@@ -1888,7 +2214,7 @@ async function loadCvatProjects(){
       +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '
       +escapeHtml(p.name)+'</option>').join('');
     if(prev) sel.value=prev;                   // restore selection if still present
-    setCvatStatus(r.projects.length+' projects (org "'+(r.org||'')+'")'
+    setCvatStatus(r.projects.length+' projects'+(r.cached?' (cached)':'')
       +(cvatLocked?' — locked to '+sel.value:' — pick one'));
   }catch(e){ setCvatStatus('request failed'); }
 }
@@ -2010,95 +2336,235 @@ function pollCvatUpload(){
   }, 1500);
 }
 
-// ---- CVAT import modal + progress ----
-let impPoll=null;
-function impMsg(t){ const e=document.getElementById('impmsg'); if(e) e.textContent=t||''; }
-function impProgText(t){ const e=document.getElementById('impprogtext'); if(e) e.textContent=t||''; }
-function impIndet(on){
-  const w=document.getElementById('impbarwrap'), b=document.getElementById('impbar');
-  if(on){ w.classList.add('indet'); b.style.width=''; b.style.marginLeft=''; }
-  else { w.classList.remove('indet'); b.style.marginLeft='0'; b.style.width='100%'; }
+// ---- CVAT browser: project cards -> task cards -> import ----
+let impPoll=null, bProjects=[], bTasks=[], browseState='projects',
+    browseProjectId=null, browseProjectName='';
+function bCard(id,name,sub,onclick){
+  return '<div class="bcard" onclick="'+onclick+'"><div class="bc-id">#'+id+'</div>'
+    +'<div class="bc-name">'+escapeHtml(name)+'</div>'
+    +(sub?'<div class="bc-sub">'+escapeHtml(sub)+'</div>':'')+'</div>';
 }
-function showImpConfig(){
-  document.getElementById('impcfg').style.display='block';
-  document.getElementById('impprog').style.display='none';
-  const run=document.getElementById('imprun'); run.style.display=''; run.disabled=false;
-  document.getElementById('impcancel').textContent='Cancel';
-  impProgText('');
+function openCvatBrowse(){
+  document.getElementById('cvatbrowse').style.display='flex';
+  browseProjects();
 }
-function showImpProgress(){
-  document.getElementById('impcfg').style.display='none';
-  document.getElementById('impprog').style.display='block';
-  document.getElementById('imprun').style.display='none';
-  document.getElementById('impcancel').textContent='Close';
-}
-async function openImpModal(){
-  document.getElementById('impmodal').style.display='flex';
-  impMsg(''); showImpConfig();
-  document.getElementById('imptask').innerHTML='<option value="">— select a project first —</option>';
-  loadImpProjects();
-  // if an import is already running, jump to its progress
+function closeCvatBrowse(){ document.getElementById('cvatbrowse').style.display='none'; }
+async function browseProjects(refresh){
+  browseState='projects';
+  document.getElementById('browseBack').style.display='none';
+  document.getElementById('browseTitle').textContent='Import from CVAT — projects';
+  const grid=document.getElementById('browseGrid');
+  grid.innerHTML='<div class="browse-empty">loading projects…</div>';
   try{
-    const s=await fetch('/api/cvat/importstatus?t='+Date.now()).then(r=>r.json());
-    if(s.running){ showImpProgress(); impIndet(true); pollCvatImport(); }
-  }catch(e){}
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
+    if(r.error){ grid.innerHTML='<div class="browse-empty">error: '+escapeHtml(r.error)+'</div>'; return; }
+    bProjects=r.projects||[];
+    grid.innerHTML = bProjects.length
+      ? bProjects.map((p,i)=>bCard(p.id,p.name,'open tasks →','openProjectIdx('+i+')')).join('')
+      : '<div class="browse-empty">no projects</div>';
+  }catch(e){ grid.innerHTML='<div class="browse-empty">failed to load projects</div>'; }
 }
-function closeImpModal(){ document.getElementById('impmodal').style.display='none'; }
-async function loadImpProjects(){
-  const sel=document.getElementById('impproj');
-  sel.innerHTML='<option value="">loading…</option>';
+function openProjectIdx(i){ const p=bProjects[i]; if(p) openProject(p.id, p.name); }
+async function openProject(pid, pname, refresh){
+  browseState='tasks'; browseProjectId=pid; browseProjectName=pname;
+  document.getElementById('browseBack').style.display='';
+  document.getElementById('browseTitle').textContent='Tasks in '+pname;
+  const grid=document.getElementById('browseGrid');
+  grid.innerHTML='<div class="browse-empty">loading tasks…</div>';
   try{
-    const r=await fetch('/api/cvat/projects?t='+Date.now()).then(r=>r.json());
-    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; impMsg('error: '+r.error); return; }
-    sel.innerHTML='<option value="">— select project —</option>'
-      +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
-  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; impMsg('project list failed'); }
+    const r=await fetch('/api/cvat/tasks?project_id='+encodeURIComponent(pid)
+      +(refresh?'&refresh=1':'')+'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ grid.innerHTML='<div class="browse-empty">error: '+escapeHtml(r.error)+'</div>'; return; }
+    bTasks=r.tasks||[];
+    grid.innerHTML = bTasks.length
+      ? bTasks.map((t,i)=>bCard(t.id,t.name,(t.size!=null?t.size+' images · ':'')+'import →','openTaskIdx('+i+')')).join('')
+      : '<div class="browse-empty">no tasks in this project</div>';
+  }catch(e){ grid.innerHTML='<div class="browse-empty">failed to load tasks</div>'; }
 }
-async function loadImpTasks(){
-  const pid=document.getElementById('impproj').value;
-  const sel=document.getElementById('imptask');
-  if(!pid){ sel.innerHTML='<option value="">— select a project first —</option>'; return; }
-  sel.innerHTML='<option value="">loading tasks…</option>';
-  try{
-    const r=await fetch('/api/cvat/tasks?project_id='+encodeURIComponent(pid)+'&t='+Date.now()).then(r=>r.json());
-    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; impMsg('error: '+r.error); return; }
-    if(!r.tasks.length){ sel.innerHTML='<option value="">no tasks in this project</option>'; return; }
-    sel.innerHTML='<option value="">— select task —</option>'
-      +r.tasks.map(t=>'<option value="'+t.id+'">'+t.id+' — '+escapeHtml(t.name)
-        +(t.size!=null?(' ('+t.size+' imgs)'):'')+'</option>').join('');
-  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; impMsg('task list failed'); }
-}
-async function runCvatImport(){
-  const task=document.getElementById('imptask').value;
-  if(!task){ impMsg('select a task'); return; }
-  impMsg(''); showImpProgress(); impIndet(true);
-  impProgText('starting import…');
+function openTaskIdx(i){ const t=bTasks[i]; if(t) openTask(t.id, t.name); }
+async function openTask(tid, tname){
+  document.getElementById('browseProg').style.display='flex';
+  document.getElementById('browseProgText').textContent='importing "'+tname+'"…';
   try{
     const r=await fetch('/api/cvat/import',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({task_id:task})}).then(r=>r.json());
-    if(r.error){ impProgText('error: '+r.error); impIndet(false); return; }
-    pollCvatImport();
-  }catch(e){ impProgText('request failed'); impIndet(false); }
+      body:JSON.stringify({task_id:tid})}).then(r=>r.json());
+    if(r.error){ document.getElementById('browseProgText').textContent='error: '+r.error; return; }
+    browsePollImport();
+  }catch(e){ document.getElementById('browseProgText').textContent='request failed'; }
 }
-function pollCvatImport(){
+function browsePollImport(){
   clearInterval(impPoll);
   impPoll=setInterval(async()=>{
     let s; try{ s=await fetch('/api/cvat/importstatus?t='+Date.now()).then(r=>r.json()); }
     catch(e){ return; }
-    impProgText(s.message||s.state||'');
+    document.getElementById('browseProgText').textContent=s.message||s.state||'';
     if(!s.running){
       clearInterval(impPoll);
-      impIndet(false);
-      document.getElementById('impcancel').textContent='Done';
-      if(s.error){ impProgText('failed: '+s.error); return; }
+      if(s.error){ return; }                     // leave the error shown; user can close
       if(s.path){
-        impProgText('imported '+s.count+' images ✓ — opening folder…');
+        document.getElementById('browseProgText').textContent='imported '+s.count+' images ✓ — opening…';
+        document.getElementById('browseProg').style.display='none';
+        closeCvatBrowse();
         document.getElementById('folder').value=s.path;
-        loadFolder();                                  // switch the app to the imported folder
+        loadFolder();                            // switch to the annotation view
       }
     }
-  }, 1200);
+  }, 1000);
+}
+function browseRefresh(){
+  if(browseState==='tasks') openProject(browseProjectId, browseProjectName, true);
+  else browseProjects(true);
+}
+function browseCancelProg(){
+  document.getElementById('browseProg').style.display='none';
+  clearInterval(impPoll);
+}
+
+// ---- Automatic annotations -> CVAT pipeline modal ----
+let apModelClasses=[], apProjectClasses=[], apPoll=null;
+function apMsg(t){ const e=document.getElementById('apmsg'); if(e) e.textContent=t||''; }
+function apProgText(t){ const e=document.getElementById('approgtext'); if(e) e.textContent=t||''; }
+function apBar(pct){ const e=document.getElementById('apbar'); if(e) e.style.width=Math.max(0,Math.min(100,pct))+'%'; }
+function apButtons(cancel,back,next,run){
+  document.getElementById('apcancel').style.display=cancel?'':'none';
+  document.getElementById('apback').style.display=back?'':'none';
+  document.getElementById('apnext').style.display=next?'':'none';
+  const r=document.getElementById('aprun'); r.style.display=run?'':'none'; r.disabled=false;
+}
+function apShowConfig(){
+  document.getElementById('apcfg').style.display='block';
+  document.getElementById('apmap').style.display='none';
+  document.getElementById('approg').style.display='none';
+  document.getElementById('apcancel').textContent='Cancel';
+  apButtons(true,false,true,false); apProgText(''); apBar(0);
+}
+function apShowMap(){
+  document.getElementById('apcfg').style.display='none';
+  document.getElementById('apmap').style.display='block';
+  document.getElementById('approg').style.display='none';
+  apButtons(false,true,false,true);
+}
+function apShowProgress(){
+  document.getElementById('apcfg').style.display='none';
+  document.getElementById('apmap').style.display='none';
+  document.getElementById('approg').style.display='block';
+  document.getElementById('apcancel').textContent='Close';
+  apButtons(true,false,false,false);
+}
+async function enterAuto(){
+  appMode='cvat'; applyMode();
+  document.getElementById('home').style.display='none';
+  document.getElementById('apmodal').style.display='flex';
+  apMsg(''); apShowConfig();
+  document.getElementById('aptask').innerHTML='<option value="">— select a project first —</option>';
+  loadApProjects(); loadModelsInto('apmodel');
+  try{
+    const s=await fetch('/api/cvat/autopipeline_status?t='+Date.now()).then(r=>r.json());
+    if(s.running){ apShowProgress(); pollAutoPipeline(); }
+  }catch(e){}
+}
+function closeApModal(){ document.getElementById('apmodal').style.display='none'; }
+async function loadApProjects(refresh){
+  const sel=document.getElementById('approj'); const prev=sel.value;
+  sel.innerHTML='<option value="">loading…</option>';
+  try{
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; apMsg('error: '+r.error); return; }
+    sel.innerHTML='<option value="">— select project —</option>'
+      +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
+    if(prev) sel.value=prev;
+    if(refresh) apMsg(r.projects.length+' projects'+(r.cached?' (cached)':' refreshed'));
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; apMsg('project list failed'); }
+}
+async function loadApTasks(refresh){
+  const pid=document.getElementById('approj').value;
+  const sel=document.getElementById('aptask');
+  if(!pid){ sel.innerHTML='<option value="">— select a project first —</option>'; return; }
+  const prev=sel.value;
+  sel.innerHTML='<option value="">loading tasks…</option>';
+  try{
+    const r=await fetch('/api/cvat/tasks?project_id='+encodeURIComponent(pid)
+      +(refresh?'&refresh=1':'')+'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; apMsg('error: '+r.error); return; }
+    if(!r.tasks.length){ sel.innerHTML='<option value="">no tasks in this project</option>'; return; }
+    sel.innerHTML='<option value="">— select task —</option>'
+      +r.tasks.map(t=>'<option value="'+t.id+'">'+t.id+' — '+escapeHtml(t.name)
+        +(t.size!=null?(' ('+t.size+' imgs)'):'')+'</option>').join('');
+    if(prev) sel.value=prev;
+    if(refresh) apMsg(r.tasks.length+' tasks'+(r.cached?' (cached)':' refreshed'));
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; apMsg('task list failed'); }
+}
+async function apNext(){
+  const pid=document.getElementById('approj').value;
+  const task=document.getElementById('aptask').value;
+  const model=document.getElementById('apmodel').value;
+  if(!pid){ apMsg('select a project'); return; }
+  if(!task){ apMsg('select a task'); return; }
+  if(!model){ apMsg('select a model'); return; }
+  apMsg('loading model + project classes…');
+  try{
+    const [mc,pc]=await Promise.all([
+      fetch('/api/modelclasses?model='+encodeURIComponent(model)+'&t='+Date.now()).then(r=>r.json()),
+      fetch('/api/cvat/projectlabels?project_id='+encodeURIComponent(pid)+'&t='+Date.now()).then(r=>r.json())
+    ]);
+    if(mc.error){ apMsg('model: '+mc.error); return; }
+    if(pc.error){ apMsg('project: '+pc.error); return; }
+    apModelClasses=mc.classes||[]; apProjectClasses=pc.classes||[];
+    if(!apModelClasses.length){ apMsg('model exposes no classes'); return; }
+    if(!apProjectClasses.length){ apMsg('project has no labels'); return; }
+    buildApMap(); apMsg(''); apShowMap();
+  }catch(e){ apMsg('failed to load classes'); }
+}
+function buildApMap(){
+  const host=document.getElementById('apmaplist');
+  const lower={}; apProjectClasses.forEach(n=>{ lower[String(n).trim().toLowerCase()]=n; });
+  const opts=(sel)=>'<option value="">— skip —</option>'
+    + apProjectClasses.map(n=>'<option value="'+escapeHtml(n)+'"'+(n===sel?' selected':'')+'>'
+        +escapeHtml(n)+'</option>').join('');
+  host.innerHTML=apModelClasses.map((mn,mi)=>{
+    const match=lower[String(mn).trim().toLowerCase()];
+    return '<div class="maprow"><span class="mc" title="'+escapeHtml(mn)+'">'+mi+': '
+      +escapeHtml(mn)+'</span><span class="arr">→</span>'
+      +'<select data-mi="'+mi+'">'+opts(match||'')+'</select></div>';
+  }).join('');
+}
+async function runAutoPipeline(){
+  const task=document.getElementById('aptask').value;
+  const model=document.getElementById('apmodel').value;
+  const conf=parseFloat(document.getElementById('apconf').value)||0.25;
+  const mode=document.getElementById('apmode').value;
+  const mapping={};
+  document.querySelectorAll('#apmaplist select').forEach(s=>{
+    if(s.value!=='') mapping[s.getAttribute('data-mi')]=s.value;   // model idx -> class NAME
+  });
+  if(!Object.keys(mapping).length){ apMsg('map at least one class'); return; }
+  apMsg(''); apShowProgress(); apBar(0); apProgText('starting…');
+  try{
+    const r=await fetch('/api/cvat/autopipeline',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task_id:task, model, conf, mode, mapping})}).then(r=>r.json());
+    if(r.error){ apProgText('error: '+r.error); return; }
+    pollAutoPipeline();
+  }catch(e){ apProgText('request failed'); }
+}
+function pollAutoPipeline(){
+  clearInterval(apPoll);
+  apPoll=setInterval(async()=>{
+    let s; try{ s=await fetch('/api/cvat/autopipeline_status?t='+Date.now()).then(r=>r.json()); }
+    catch(e){ return; }
+    const pct = (s.state==='annotating'&&s.total) ? Math.round((s.done/s.total)*100)
+              : (s.state==='uploading'?92:(s.state==='importing'?8:0));
+    apBar(s.running?pct:100);
+    apProgText((s.message||s.state||'')+(s.state==='annotating'&&s.total?(' — '+s.done+'/'+s.total):''));
+    if(!s.running){
+      clearInterval(apPoll); apBar(100);
+      document.getElementById('apcancel').textContent='Done';
+      if(s.error) apProgText('failed: '+s.error);
+      else if(s.task_id) apProgText('done ✓ — '+s.added+' boxes, task '+s.task_id
+        +(s.task_url?' ('+s.task_url+')':''));
+    }
+  }, 1000);
 }
 
 async function saveIfDirty(){
@@ -2307,6 +2773,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   document.getElementById('folder').value = m.path || '';
   buildClassUI();
   updateNav();
+  applyMode();                 // default to Local (CVAT section hidden until chosen)
   loadCvatProjects();          // populate the CVAT project dropdown in the background
   if(!count){ setStatus('no images in '+(m.path||'')+' — set a folder above'); return; }
   load(0);
