@@ -143,9 +143,7 @@ def label_path_for(img_name):
     return os.path.join(LBL_DIR, stem + ".txt")
 
 
-def read_label(img_name):
-    """Return list of dicts {cls, cx, cy, w, h} (normalised) for an image."""
-    p = label_path_for(img_name)
+def _read_label_file(p):
     boxes = []
     if os.path.exists(p):
         with open(p) as fh:
@@ -154,12 +152,14 @@ def read_label(img_name):
                 if len(parts) < 5:
                     continue
                 cls, cx, cy, w, h = parts[:5]
-                boxes.append({
-                    "cls": int(float(cls)),
-                    "cx": float(cx), "cy": float(cy),
-                    "w": float(w), "h": float(h),
-                })
+                boxes.append({"cls": int(float(cls)), "cx": float(cx),
+                              "cy": float(cy), "w": float(w), "h": float(h)})
     return boxes
+
+
+def read_label(img_name):
+    """Return list of dicts {cls, cx, cy, w, h} (normalised) for an image."""
+    return _read_label_file(label_path_for(img_name))
 
 
 def _write_label_file(path, boxes):
@@ -825,6 +825,20 @@ def api_models():
     return jsonify({"models": list_models(), "dir": MODELS_DIR})
 
 
+@app.route("/api/modelclasses")
+def api_modelclasses():
+    """Class names of a model (ordered by index), for the mapping step."""
+    model_path = _safe_model_path(request.args.get("model", ""))
+    if not model_path:
+        return jsonify({"error": "invalid model"}), 400
+    try:
+        model = _load_model(model_path)
+        names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
+        return jsonify({"classes": [names[k] for k in sorted(names)]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/autoannotate/<int:idx>")
 def api_autoannotate(idx):
     """Run the chosen model on ONE image; return detections for the client to
@@ -855,7 +869,8 @@ def _set_aa(**kw):
         _aa_job.update(kw)
 
 
-def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf, overwrite):
+def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf,
+                         mode, mapping):
     global CLASSES
     try:
         model = _load_model(model_path)
@@ -871,33 +886,46 @@ def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf, ov
                     CLASSES = list(classes)
             except OSError:
                 pass
+        # mapping: model class index -> here class index. If absent, fall back to
+        # matching each detection's class name to the class list.
+        use_map = bool(mapping)
         name_to_idx = {str(n).strip().lower(): i for i, n in enumerate(classes)}
-        written = skipped = unmapped = 0
+        written = skipped = unmapped = added = 0
         for i, img in enumerate(images):
             _set_aa(done=i, message=f"annotating {i+1}/{len(images)}…")
             stem = os.path.splitext(img)[0]
             lbl_path = os.path.join(lbl_dir, stem + ".txt")
-            if not overwrite and os.path.exists(lbl_path) and os.path.getsize(lbl_path) > 0:
+            has_existing = os.path.exists(lbl_path) and os.path.getsize(lbl_path) > 0
+            if mode == "skip" and has_existing:
                 skipped += 1
                 continue
             try:
                 dets, _ = _infer(model_path, os.path.join(img_dir, img), conf)
             except Exception:
                 continue
-            boxes = []
+            new_boxes = []
             for d in dets:
-                ci = name_to_idx.get(str(d["name"]).strip().lower())
-                if ci is None:
+                if use_map:
+                    ci = mapping.get(d.get("cls_model"))
+                else:
+                    ci = name_to_idx.get(str(d["name"]).strip().lower())
+                if ci is None or not (0 <= ci < len(classes)):
                     unmapped += 1
                     continue
-                boxes.append({"cls": ci, "cx": d["cx"], "cy": d["cy"],
-                              "w": d["w"], "h": d["h"]})
+                new_boxes.append({"cls": ci, "cx": d["cx"], "cy": d["cy"],
+                                  "w": d["w"], "h": d["h"]})
+            # append keeps the existing annotations and adds the detections
+            boxes = (_read_label_file(lbl_path) + new_boxes) if mode == "append" else new_boxes
             _write_label_file(lbl_path, boxes)
             written += 1
+            added += len(new_boxes)
+        msg = f"done ✓ {written} images, {added} boxes added"
+        if skipped:
+            msg += f", {skipped} skipped (already labelled)"
+        if unmapped:
+            msg += f", {unmapped} dets unmapped"
         _set_aa(running=False, state="done", done=len(images),
-                written=written, skipped=skipped, unmapped=unmapped,
-                message=f"done ✓ wrote {written}, skipped {skipped} existing"
-                        + (f", {unmapped} dets had no matching class" if unmapped else ""))
+                written=written, skipped=skipped, unmapped=unmapped, message=msg)
     except Exception as e:
         _set_aa(running=False, state="error", error=str(e), message=f"failed: {e}")
 
@@ -917,14 +945,24 @@ def api_autoannotate_all():
     classes = data.get("classes")
     if not isinstance(classes, list):
         classes = list(CLASSES)
-    overwrite = bool(data.get("overwrite"))
+    mode = data.get("mode")
+    if mode not in ("skip", "append", "replace"):
+        mode = "append"
+    raw_map = data.get("mapping") or {}
+    mapping = {}
+    if isinstance(raw_map, dict):
+        for k, v in raw_map.items():
+            try:
+                mapping[int(k)] = int(v)
+            except (TypeError, ValueError):
+                pass
     with _aa_lock:
         if _aa_job["running"]:
             return jsonify({"error": "an auto-annotation run is already going"}), 409
         _aa_job.update(running=True, state="starting", done=0, total=len(IMAGES),
                        written=0, skipped=0, unmapped=0,
                        message="loading model…", error=None)
-    args = (model_path, list(IMAGES), IMG_DIR, LBL_DIR, list(classes), conf, overwrite)
+    args = (model_path, list(IMAGES), IMG_DIR, LBL_DIR, list(classes), conf, mode, mapping)
     threading.Thread(target=_do_autoannotate_all, args=args, daemon=True).start()
     return jsonify({"started": True, "count": len(IMAGES)})
 
@@ -1009,6 +1047,8 @@ HTML = r"""<!DOCTYPE html>
   .lp-sec select{width:100%;box-sizing:border-box;padding:6px;background:#1b1b1b;
      color:#eee;border:1px solid #555;border-radius:5px;font-size:14px;}
   /* per-class visibility rows */
+  .collapse-h{cursor:pointer;user-select:none;}
+  .collapse-h #viscaret{font-size:9px;color:#8aa;display:inline-block;width:10px;}
   #visiblelist{display:flex;flex-direction:column;gap:2px;max-height:230px;overflow:auto;}
   .vis-row{display:flex;align-items:center;gap:7px;padding:3px 4px;cursor:pointer;
            font-size:12px;border-radius:4px;}
@@ -1079,6 +1119,14 @@ HTML = r"""<!DOCTYPE html>
   @keyframes indet{0%{margin-left:-35%}100%{margin-left:100%}}
   #aaprogtext,#cvprogtext,#impprogtext{font-size:12px;color:#cde;}
   .aamsg{font-size:11px;color:#e9a;min-height:14px;}
+  .maphint{font-size:11px;color:#9aa;margin-bottom:8px;line-height:1.4;}
+  #aamaplist{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow:auto;}
+  .maprow{display:flex;align-items:center;gap:8px;}
+  .maprow .mc{flex:0 0 42%;font-size:12px;color:#cfe;overflow:hidden;
+              text-overflow:ellipsis;white-space:nowrap;}
+  .maprow .arr{color:#778;}
+  .maprow select{flex:1;min-width:0;padding:5px;background:#1b1b1b;color:#eee;
+                 border:1px solid #555;border-radius:5px;font-size:12px;}
   .cvtarget{font-size:13px;color:#cde;background:#1b1b1b;border:1px solid #555;
             border-radius:5px;padding:7px;word-break:break-word;}
 </style>
@@ -1113,12 +1161,14 @@ HTML = r"""<!DOCTYPE html>
       <select id="classsel" onchange="setActiveClass(parseInt(this.value,10))"></select>
     </div>
     <div class="lp-sec">
-      <h4>Visible labels</h4>
-      <div class="lp-row" style="margin-bottom:6px;">
-        <button class="grow" onclick="setAllVisible(true)">All</button>
-        <button class="grow" onclick="setAllVisible(false)">None</button>
+      <h4 class="collapse-h" onclick="toggleVisSec()"><span id="viscaret">&#9654;</span> Visible labels</h4>
+      <div id="visbody" style="display:none;">
+        <div class="lp-row" style="margin-bottom:6px;">
+          <button class="grow" onclick="setAllVisible(true)">All</button>
+          <button class="grow" onclick="setAllVisible(false)">None</button>
+        </div>
+        <div id="visiblelist"></div>
       </div>
-      <div id="visiblelist"></div>
     </div>
     <div class="lp-sec">
       <h4>Automatic annotation</h4>
@@ -1177,7 +1227,16 @@ HTML = r"""<!DOCTYPE html>
         <select id="aamodel"><option value="">— loading models… —</option></select>
         <label>Confidence</label>
         <input id="aaconf" type="number" min="0" max="1" step="0.05" value="0.25">
-        <label class="tick" style="margin-top:8px;"><input type="checkbox" id="aaoverwrite"> overwrite existing labels</label>
+        <label>If a label already exists</label>
+        <select id="aamode">
+          <option value="append">add detections to it</option>
+          <option value="replace">replace it</option>
+          <option value="skip">skip the image</option>
+        </select>
+      </div>
+      <div id="aamap" style="display:none;">
+        <div class="maphint">Map each <b>model class</b> → a class here (auto-matched by name; pick <i>skip</i> to drop one):</div>
+        <div id="aamaplist"></div>
       </div>
       <div id="aaprog" style="display:none;">
         <div class="bar"><div id="aabar"></div></div>
@@ -1187,7 +1246,9 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="modal-f">
       <button id="aacancel" onclick="closeAaModal()">Cancel</button>
-      <button id="aarun" class="ok" onclick="runAutoAnnotate()">Annotate</button>
+      <button id="aaback" onclick="aaShowConfig()" style="display:none;">Back</button>
+      <button id="aanext" class="ok" onclick="aaNext()">Next</button>
+      <button id="aarun" class="ok" onclick="runAutoAnnotate()" style="display:none;">Annotate</button>
     </div>
   </div>
 </div>
@@ -1309,6 +1370,12 @@ function buildVisibleUI(){
     +'<span class="sw" style="background:'+classColor(i)+'"></span>'
     +'<span class="vis-name">'+escapeHtml(n)+'</span></label>').join('');
 }
+function toggleVisSec(){
+  const b=document.getElementById('visbody');
+  const open = b.style.display==='none';
+  b.style.display = open ? 'block' : 'none';
+  document.getElementById('viscaret').innerHTML = open ? '&#9660;' : '&#9654;';  // ▼ / ▶
+}
 function toggleClassVis(i, on){
   if(on) hiddenClasses.delete(i); else hiddenClasses.add(i);
   draw();
@@ -1415,11 +1482,18 @@ function renderPanel(){
     return names.map((n,i)=>'<option value="'+i+'"'+(i===cur?' selected':'')+'>'
       +i+': '+escapeHtml(n)+'</option>').join('');
   };
-  let html='<div class="sec">Boxes on this image ('+boxes.length+')</div>';
+  // only list boxes whose class is currently visible (mirrors the canvas)
+  const shownN=boxes.filter(b=>!hiddenClasses.has(b.cls)).length;
+  const hiddenN=boxes.length-shownN;
+  let html='<div class="sec">Boxes on this image ('+shownN
+    +(hiddenN?(' shown / '+boxes.length+' total'):'')+')</div>';
   if(!boxes.length){
     html+='<div style="color:#777;padding:8px 10px;">none &mdash; draw a box</div>';
+  } else if(!shownN){
+    html+='<div style="color:#777;padding:8px 10px;">all classes hidden</div>';
   } else {
     boxes.forEach((b,i)=>{
+      if(hiddenClasses.has(b.cls)) return;
       html+='<div class="row'+(i===sel?' selrow':'')+'" onclick="selectBox('+i+')">'
         +'<span class="ix" style="color:'+classColor(b.cls)+'">#'+(i+1)+'</span>'
         +'<select onclick="event.stopPropagation()" onchange="setCls('+i+',this.value)">'+opts(b.cls)+'</select>'
@@ -1636,22 +1710,65 @@ async function loadModels(){
       +'</option>').join('');
   }catch(e){ sel.innerHTML='<option value="">— error —</option>'; setAaMsg('model list failed'); }
 }
-function showAaConfig(){
+// three views: config -> map -> progress, with matching footer buttons
+function aaButtons(cancel,back,next,run){
+  document.getElementById('aacancel').style.display=cancel?'':'none';
+  document.getElementById('aaback').style.display=back?'':'none';
+  document.getElementById('aanext').style.display=next?'':'none';
+  const r=document.getElementById('aarun'); r.style.display=run?'':'none'; r.disabled=false;
+}
+function aaShowConfig(){
   document.getElementById('aacfg').style.display='block';
+  document.getElementById('aamap').style.display='none';
   document.getElementById('aaprog').style.display='none';
-  const run=document.getElementById('aarun'); run.style.display=''; run.disabled=false;
   document.getElementById('aacancel').textContent='Cancel';
-  aaProgText(''); setBar(0);
+  aaButtons(true,false,true,false); aaProgText(''); setBar(0);
+}
+function aaShowMap(){
+  document.getElementById('aacfg').style.display='none';
+  document.getElementById('aamap').style.display='block';
+  document.getElementById('aaprog').style.display='none';
+  aaButtons(false,true,false,true);
 }
 function showAaProgress(){
   document.getElementById('aacfg').style.display='none';
+  document.getElementById('aamap').style.display='none';
   document.getElementById('aaprog').style.display='block';
-  document.getElementById('aarun').style.display='none';
   document.getElementById('aacancel').textContent='Close';
+  aaButtons(true,false,false,false);
+}
+let aaModelClasses=[];
+async function aaNext(){
+  const model=document.getElementById('aamodel').value;
+  if(!model){ setAaMsg('select a model'); return; }
+  setAaMsg('loading model classes…');
+  try{
+    const r=await fetch('/api/modelclasses?model='+encodeURIComponent(model)
+      +'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ setAaMsg('error: '+r.error); return; }
+    aaModelClasses=r.classes||[];
+    if(!aaModelClasses.length){ setAaMsg('model exposes no classes'); return; }
+    buildAaMap(); setAaMsg(''); aaShowMap();
+  }catch(e){ setAaMsg('failed to load model classes'); }
+}
+// build the model-class -> here-class mapping rows (auto-match by name)
+function buildAaMap(){
+  const host=document.getElementById('aamaplist');
+  const names = classes.length ? classes : [];
+  const lower={}; names.forEach((n,i)=>{ lower[String(n).trim().toLowerCase()]=i; });
+  const opts=(selIdx)=>'<option value="">— skip —</option>'
+    + names.map((n,i)=>'<option value="'+i+'"'+(i===selIdx?' selected':'')+'>'
+        +i+': '+escapeHtml(n)+'</option>').join('');
+  host.innerHTML = aaModelClasses.map((mn,mi)=>{
+    const m=lower[String(mn).trim().toLowerCase()];
+    return '<div class="maprow"><span class="mc" title="'+escapeHtml(mn)+'">'+mi+': '
+      +escapeHtml(mn)+'</span><span class="arr">→</span>'
+      +'<select data-mi="'+mi+'">'+opts(m===undefined?-1:m)+'</select></div>';
+  }).join('');
 }
 async function openAaModal(){
   document.getElementById('aamodal').style.display='flex';
-  setAaMsg(''); showAaConfig(); loadModels();
+  setAaMsg(''); aaShowConfig(); loadModels();
   // if a run is already in progress (modal was closed), jump back to it
   try{
     const s=await fetch('/api/autoannotate_status?t='+Date.now()).then(r=>r.json());
@@ -1662,15 +1779,20 @@ function closeAaModal(){ document.getElementById('aamodal').style.display='none'
 let aaPoll=null;
 async function runAutoAnnotate(){
   const model=document.getElementById('aamodel').value;
-  if(!model){ setAaMsg('select a model'); return; }
   const conf=parseFloat(document.getElementById('aaconf').value)||0.25;
-  const overwrite=document.getElementById('aaoverwrite').checked;
+  const mode=document.getElementById('aamode').value;
+  // gather the model-class -> here-class mapping from the dropdowns
+  const mapping={};
+  document.querySelectorAll('#aamaplist select').forEach(s=>{
+    if(s.value!=='') mapping[s.getAttribute('data-mi')]=parseInt(s.value,10);
+  });
+  if(!Object.keys(mapping).length){ setAaMsg('map at least one class (or all are set to skip)'); return; }
   setAaMsg(''); showAaProgress();
   setBar(0); aaProgText('starting… ('+count+' images)');
   try{
     const r=await fetch('/api/autoannotate_all',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model, conf, overwrite, classes})}).then(r=>r.json());
+      body:JSON.stringify({model, conf, mode, classes, mapping})}).then(r=>r.json());
     if(r.error){ aaProgText('error: '+r.error); return; }
     pollAutoAnnotate();
   }catch(e){ aaProgText('request failed'); }
