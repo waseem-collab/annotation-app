@@ -1129,10 +1129,45 @@ HTML = r"""<!DOCTYPE html>
                  border:1px solid #555;border-radius:5px;font-size:12px;}
   .cvtarget{font-size:13px;color:#cde;background:#1b1b1b;border:1px solid #555;
             border-radius:5px;padding:7px;word-break:break-word;}
+  /* landing / home screen */
+  #home{position:fixed;inset:0;z-index:200;background:#161616;display:flex;
+        align-items:center;justify-content:center;}
+  .home-inner{text-align:center;max-width:760px;padding:24px;}
+  .home-title{font-size:30px;margin:0 0 4px;color:#eee;font-weight:700;letter-spacing:.5px;}
+  .home-sub{color:#9aa;margin:0 0 28px;font-size:14px;}
+  .home-cards{display:flex;gap:20px;justify-content:center;flex-wrap:wrap;}
+  .home-card{width:300px;background:#222;border:1px solid #333;border-radius:14px;
+             padding:26px 22px;cursor:pointer;text-align:left;
+             transition:transform .12s,border-color .12s,background .12s;}
+  .home-card:hover{transform:translateY(-3px);border-color:#49a05f;background:#262b27;}
+  .hc-icon{color:#7fd1ff;margin-bottom:14px;}
+  .home-card.cvat .hc-icon{color:#9af2b5;}
+  .hc-title{font-size:18px;font-weight:600;color:#eee;margin-bottom:8px;}
+  .hc-desc{font-size:13px;color:#9ab;line-height:1.5;}
+  #homeBtn{font-size:16px;line-height:1;padding:6px 10px;}
 </style>
 </head>
 <body>
+<div id="home">
+  <div class="home-inner">
+    <h1 class="home-title">Annotation Studio</h1>
+    <p class="home-sub">Choose how to start</p>
+    <div class="home-cards">
+      <div class="home-card local" onclick="enterLocal()">
+        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" width="44" height="44" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <div class="hc-title">Annotate locally</div>
+        <div class="hc-desc">Open a folder of images + YOLO labels on this machine and start annotating.</div>
+      </div>
+      <div class="home-card cvat" onclick="enterImport()">
+        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" width="44" height="44" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4 4 0 0 1-.5-7.97A6 6 0 0 1 18 9a3.5 3.5 0 0 1 0 9z"/><path d="M12 11v6m0 0l-2.4-2.4M12 17l2.4-2.4"/></svg></div>
+        <div class="hc-title">Import from CVAT</div>
+        <div class="hc-desc">Pull a task's images + annotations from CVAT and edit them here.</div>
+      </div>
+    </div>
+  </div>
+</div>
 <div id="topnav">
+  <button id="homeBtn" onclick="goHome()" title="home">&#8962;</button>
   <button onclick="go(-1)" title="prev (A)">&#9664; Prev</button>
   <button onclick="go(1)" title="next (D)">Next &#9654;</button>
   <input id="scrub" type="range" min="0" max="0" value="0"
@@ -1514,6 +1549,12 @@ function removeBox(i){
   if(sel===i) sel=-1; else if(sel>i) sel--;
   touched=true; markDirty(true); draw(); maybeAutosave();
 }
+
+// ---- landing screen ----
+function enterLocal(){ document.getElementById('home').style.display='none';
+  if(img.complete && img.naturalWidth){ fit(); draw(); } }
+function enterImport(){ document.getElementById('home').style.display='none'; openImpModal(); }
+function goHome(){ document.getElementById('home').style.display='flex'; }
 
 // delete the current image (and its label) from disk, then advance
 async function deleteImage(){
