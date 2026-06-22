@@ -2331,15 +2331,18 @@ function showCvProgress(){
   document.getElementById('cvrun').style.display='none';
   document.getElementById('cvcancel').textContent='Close';
 }
-// updating an imported task hides the "create new" fields
+// the "update source task" option only applies in CVAT mode (imported folder)
+function cvIsUpdate(){
+  return appMode==='cvat' && linkedTask && document.getElementById('cvupdate').checked;
+}
+// updating an imported task hides the "create new" (project + task name) fields
 function cvUpdateToggle(){
-  const upd = linkedTask && document.getElementById('cvupdate').checked;
-  document.getElementById('cvnewwrap').style.display = upd ? 'none' : 'block';
+  document.getElementById('cvnewwrap').style.display = cvIsUpdate() ? 'none' : 'block';
   updateCvRunState();
 }
 function updateCvRunState(){
   const run=document.getElementById('cvrun');
-  if(linkedTask && document.getElementById('cvupdate').checked){ run.disabled=false; cvMsg(''); return; }
+  if(cvIsUpdate()){ run.disabled=false; cvMsg(''); return; }
   const sel=document.getElementById('cvatproj');
   if(sel.value){ run.disabled=false; cvMsg(''); }
   else { run.disabled=true; cvMsg('pick a CVAT project on the left first'); }
@@ -2347,9 +2350,9 @@ function updateCvRunState(){
 async function openCvModal(){
   document.getElementById('cvmodal').style.display='flex';
   cvMsg(''); showCvConfig();
-  // linked-task (imported folder) option
+  // linked-task (imported folder) update option — only in CVAT mode
   const lw=document.getElementById('cvlinkwrap');
-  if(linkedTask){
+  if(appMode==='cvat' && linkedTask){
     lw.style.display='block';
     document.getElementById('cvlinkedname').textContent='#'+linkedTask.task_id
       +(linkedTask.task_name?(' ('+linkedTask.task_name+')'):'');
@@ -2369,7 +2372,7 @@ async function openCvModal(){
 }
 function closeCvModal(){ document.getElementById('cvmodal').style.display='none'; }
 async function runCvatUpload(){
-  const updating = linkedTask && document.getElementById('cvupdate').checked;
+  const updating = cvIsUpdate();
   let body;
   if(updating){
     body={task_id:linkedTask.task_id, classes};
