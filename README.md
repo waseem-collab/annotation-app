@@ -16,11 +16,17 @@ one-click upload to CVAT.
 - **Existing labels always shown & editable** by default; edits autosave to `labels/`.
 - **Top scrubber** — drag the slider to fly through every image in real time.
 - **Box-count filter**, zoom (scroll wheel), and keyboard nav (`A`/`D`, `S` to save).
-- **Automatic annotation** — pick a YOLO `.pt` model from a folder, set a confidence,
-  and batch-annotate the whole folder with a live progress bar. Detections are mapped
-  to your class list by name.
+- **Per-class visibility** — checkboxes to show/hide labels on the canvas (view only;
+  hidden boxes are still saved).
+- **Delete image** — remove the current image and its label from disk, then advance.
+- **Automatic annotation** — pick a YOLO `.pt` model (popup), set a confidence, and
+  batch-annotate the whole folder with a live progress bar. Detections are mapped to
+  your class list by name.
 - **CVAT upload** — list projects from a dropdown, pull a project's classes to annotate
-  with, and upload the current folder (images + YOLO labels) as a new task.
+  with, and upload the current folder (images + YOLO labels) as a new task — or, for an
+  imported folder, **update the source task's annotations** in place.
+- **CVAT import** — pick a project then a task and import its images + annotations into a
+  local folder to edit here.
 
 ## Dataset layout
 

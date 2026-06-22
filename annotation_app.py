@@ -34,7 +34,9 @@ Labels are YOLO format: "<class> <cx> <cy> <w> <h>" normalised to [0,1].
 """
 
 import os
+import re
 import glob
+import json
 import threading
 from flask import Flask, jsonify, request, send_file, Response
 
@@ -57,6 +59,9 @@ CVAT_ORG = os.getenv("CVAT_ORG_SLUG") or "visionify"
 
 # Folder of YOLO .pt models for automatic annotation (override with MODELS_DIR).
 MODELS_DIR = os.getenv("MODELS_DIR") or os.path.join(BASE, "models")
+
+# Where imported CVAT tasks are unpacked (override with IMPORTS_DIR).
+IMPORTS_DIR = os.getenv("IMPORTS_DIR") or os.path.join(BASE, "imports")
 # Remembers the last folder you loaded, so the UI reopens it next launch.
 STATE_FILE = os.path.join(BASE, ".annotation_app_state")
 
@@ -183,9 +188,26 @@ def write_label(img_name, boxes):
 # --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
+def _linked_task():
+    """If the current folder was imported from a CVAT task, return its info
+    (includes the full frame map for upload use)."""
+    try:
+        with open(os.path.join(DATA, ".cvat_task.json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _linked_task_public():
+    """Linked-task info without the (potentially large) frame map, for the UI."""
+    lt = _linked_task()
+    return {k: v for k, v in lt.items() if k != "frames"} if lt else None
+
+
 @app.route("/api/meta")
 def api_meta():
-    return jsonify({"count": len(IMAGES), "path": DATA, "classes": CLASSES})
+    return jsonify({"count": len(IMAGES), "path": DATA, "classes": CLASSES,
+                    "linked_task": _linked_task_public()})
 
 
 @app.route("/api/setfolder", methods=["POST"])
@@ -208,7 +230,8 @@ def api_setfolder():
     CLASSES = read_classes()
     _remember_folder(DATA)          # so the UI reopens this folder next launch
     return jsonify({"ok": True, "count": len(IMAGES),
-                    "path": DATA, "classes": CLASSES})
+                    "path": DATA, "classes": CLASSES,
+                    "linked_task": _linked_task_public()})
 
 
 @app.route("/api/item/<int:idx>")
@@ -241,25 +264,24 @@ def api_save(idx):
     return jsonify({"ok": True, "saved": IMAGES[idx], "n": len(boxes)})
 
 
-@app.route("/api/filter")
-def api_filter():
-    """Return indices of images whose box count compares to `n` via `op`
-    (op = gt | lt | eq, i.e. > / < / =)."""
-    op = request.args.get("op", "gt")
+@app.route("/api/delete/<int:idx>", methods=["POST"])
+def api_delete(idx):
+    """Delete an image and its label file from disk, then refresh the list."""
+    global IMAGES
+    if idx < 0 or idx >= len(IMAGES):
+        return jsonify({"error": "out of range"}), 404
+    name = IMAGES[idx]
     try:
-        n = int(request.args.get("n", "0"))
-    except ValueError:
-        n = 0
-
-    def keep(c):
-        if op == "lt":
-            return c < n
-        if op == "eq":
-            return c == n
-        return c > n          # default / "gt"
-
-    indices = [i for i, name in enumerate(IMAGES) if keep(len(read_label(name)))]
-    return jsonify({"op": op, "n": n, "indices": indices, "matched": len(indices)})
+        img_path = os.path.join(IMG_DIR, name)
+        if os.path.exists(img_path):
+            os.remove(img_path)
+        lbl_path = label_path_for(name)
+        if os.path.exists(lbl_path):
+            os.remove(lbl_path)
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+    IMAGES = list_images()
+    return jsonify({"ok": True, "deleted": name, "count": len(IMAGES)})
 
 
 # --------------------------------------------------------------------------- #
@@ -301,6 +323,55 @@ def _build_yolo_zip(images, classes, lbl_dir, zip_path):
         z.writestr("train.txt", "\n".join(train_lines) + "\n")
 
 
+def _build_update_zip(lbl_dir, classes, frames, subset, zip_path):
+    """Build a YOLO 1.1 zip whose frame paths/subset match the CVAT task exactly,
+    so importing it updates the right frames. `frames` maps image basename ->
+    the task's frame path (e.g. 'ppe-detection/V4.0/PM4 ...jpg')."""
+    import zipfile
+    sub = subset or "train"
+    folder = f"obj_{sub}_data"
+    listname = f"{sub}.txt"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("obj.names", "\n".join(classes) + "\n")
+        z.writestr("obj.data",
+                   f"classes = {len(classes)}\n"
+                   f"{sub} = data/{listname}\n"
+                   "names = data/obj.names\n"
+                   "backup = backup/\n")
+        lines = []
+        for base, frame in frames.items():
+            stem_base = os.path.splitext(base)[0]
+            lp = os.path.join(lbl_dir, stem_base + ".txt")
+            content = ""
+            if os.path.exists(lp):
+                with open(lp) as fh:
+                    content = fh.read()
+            frame_stem = os.path.splitext(frame)[0]
+            z.writestr(f"{folder}/{frame_stem}.txt", content)
+            lines.append(f"data/{folder}/{frame}")
+        z.writestr(listname, "\n".join(lines) + "\n")
+
+
+def _cvat_import_annotations(client, task_id, zip_path):
+    """Upload annotations to an existing task via TUS with location=local (needed
+    when the task's storage is cloud-backed). Replicates the SDK uploader but
+    adds the location param the high-level helper omits."""
+    from pathlib import Path
+    from cvat_sdk.core.uploading import AnnotationUploader
+    task = client.tasks.retrieve(int(task_id))
+    up = AnnotationUploader(client)
+    fn = Path(zip_path)
+    url = client.api_map.make_endpoint_url(
+        task.api.create_annotations_endpoint.path, kwsub={"id": int(task_id)})
+    params = {"format": "YOLO 1.1", "filename": fn.name, "location": "local"}
+    resp = up.upload_file(url, fn, query_params=params,
+                          meta={"filename": params["filename"]})
+    rq_id = json.loads(resp.data).get("rq_id")
+    if not rq_id:
+        raise RuntimeError("no rq_id from annotation upload")
+    client.wait_for_completion(rq_id, status_check_period=2)
+
+
 _cvat_job = {"running": False, "state": "idle", "message": "",
              "task_id": None, "task_url": None, "error": None}
 _cvat_job_lock = threading.Lock()
@@ -311,22 +382,45 @@ def _set_job(**kw):
         _cvat_job.update(kw)
 
 
-def _do_cvat_upload(project_id, task_name, images, img_dir, lbl_dir, classes):
+def _do_cvat_upload(project_id, task_name, task_id, frames, subset,
+                    images, img_dir, lbl_dir, classes):
     import tempfile
     zip_path = None
     try:
         from cvat_sdk.core.proxies.tasks import ResourceType
         import cvat_sdk.models as models
+
+        # ---- update annotations on an EXISTING task (from an import) ----
+        if task_id:
+            if not classes:
+                raise RuntimeError("no labels.txt/classes to upload")
+            fmap = frames if frames else {n: n for n in images}
+            fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_upd_")
+            os.close(fd)
+            _build_update_zip(lbl_dir, classes, fmap, subset, zip_path)
+            _set_job(state="uploading",
+                     message=f"updating annotations on task {task_id}…")
+            with _cvat_client() as client:
+                task = client.tasks.retrieve(int(task_id))
+                task.remove_annotations()                 # clean replace
+                _cvat_import_annotations(client, int(task_id), zip_path)
+            _set_job(state="done", running=False, task_id=int(task_id),
+                     task_url=f"{CVAT_URL}/tasks/{task_id}",
+                     message=f"updated task {task_id} ✓")
+            return
+
+        # ---- create a NEW task ----
+        if classes:
+            fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_yolo_")
+            os.close(fd)
+            _build_yolo_zip(images, classes, lbl_dir, zip_path)
         image_paths = [os.path.join(img_dir, n) for n in images]
         kwargs = dict(
             spec=models.TaskWriteRequest(name=task_name, project_id=int(project_id)),
             resources=image_paths,
             resource_type=ResourceType.LOCAL,
         )
-        if classes:
-            fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_yolo_")
-            os.close(fd)
-            _build_yolo_zip(images, classes, lbl_dir, zip_path)
+        if zip_path:
             kwargs["annotation_path"] = zip_path
             kwargs["annotation_format"] = "YOLO 1.1"
             _set_job(state="uploading",
@@ -386,6 +480,7 @@ def api_cvat_upload():
     """Kick off a background upload of the CURRENT folder's images (+ YOLO labels)
     as a new task under the chosen project."""
     data = request.get_json(force=True)
+    task_id = data.get("task_id")             # set => update this existing task
     project_id = data.get("project_id")
     task_name = (data.get("task_name") or "").strip()
     # classes the boxes were drawn against (from CVAT project or labels.txt);
@@ -393,10 +488,14 @@ def api_cvat_upload():
     classes = data.get("classes")
     if not isinstance(classes, list) or not classes:
         classes = list(CLASSES)
-    if not project_id:
-        return jsonify({"error": "no project selected"}), 400
-    if not task_name:
-        return jsonify({"error": "task name is required"}), 400
+    if task_id:
+        if not classes:
+            return jsonify({"error": "no labels to upload"}), 400
+    else:
+        if not project_id:
+            return jsonify({"error": "no project selected"}), 400
+        if not task_name:
+            return jsonify({"error": "task name is required"}), 400
     if not IMAGES:
         return jsonify({"error": "no images in the current folder"}), 400
     if not (CVAT_URL and CVAT_USER and CVAT_PASS):
@@ -406,17 +505,244 @@ def api_cvat_upload():
             return jsonify({"error": "an upload is already running"}), 409
         _cvat_job.update(running=True, state="starting", message="preparing upload…",
                          task_id=None, task_url=None, error=None)
+    # for an update, pull the frame map / subset recorded at import time
+    frames = subset = None
+    if task_id:
+        linked = _linked_task() or {}
+        frames = linked.get("frames")
+        subset = linked.get("subset")
     # snapshot the current dataset so a folder switch mid-upload can't corrupt it
-    args = (project_id, task_name, list(IMAGES), IMG_DIR, LBL_DIR, list(classes))
+    args = (project_id, task_name, task_id, frames, subset,
+            list(IMAGES), IMG_DIR, LBL_DIR, list(classes))
     threading.Thread(target=_do_cvat_upload, args=args, daemon=True).start()
     return jsonify({"started": True, "count": len(IMAGES),
-                    "annotations": bool(classes)})
+                    "annotations": bool(classes), "update": bool(task_id)})
 
 
 @app.route("/api/cvat/uploadstatus")
 def api_cvat_uploadstatus():
     with _cvat_job_lock:
         return jsonify(dict(_cvat_job))
+
+
+# --------------------------------------------------------------------------- #
+# CVAT import (download a task's images + annotations, open it locally)
+# --------------------------------------------------------------------------- #
+def _safe_name(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_") or "task"
+
+
+def _cvat_list_tasks(project_id):
+    with _cvat_client() as client:
+        out, page = [], 1
+        while True:
+            data, _ = client.api_client.tasks_api.list(
+                project_id=int(project_id), page=page, page_size=100)
+            for t in data.results:
+                out.append({"id": t.id, "name": t.name, "size": getattr(t, "size", None)})
+            if not getattr(data, "next", None):
+                break
+            page += 1
+        return out
+
+
+@app.route("/api/cvat/tasks")
+def api_cvat_tasks():
+    pid = request.args.get("project_id")
+    if not pid:
+        return jsonify({"error": "no project id"}), 400
+    try:
+        tasks = _cvat_list_tasks(pid)
+        tasks.sort(key=lambda t: t["id"])
+        return jsonify({"tasks": tasks})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+_imp_job = {"running": False, "state": "idle", "message": "",
+            "path": None, "count": 0, "error": None}
+_imp_lock = threading.Lock()
+
+
+def _set_imp(**kw):
+    with _imp_lock:
+        _imp_job.update(kw)
+
+
+def _extract_yolo_export(zip_path, out_dir):
+    """Unpack a CVAT 'YOLO 1.1' (with images) export into images/ + labels/ +
+    labels.txt. Also returns the frame paths (relative to obj_<subset>_data, as
+    CVAT names its frames) and the subset name, so an update can rebuild a zip
+    that matches the task's frames exactly."""
+    import zipfile
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="cvat_imp_")
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmp)
+        img_out = os.path.join(out_dir, "images")
+        lbl_out = os.path.join(out_dir, "labels")
+        os.makedirs(img_out, exist_ok=True)
+        os.makedirs(lbl_out, exist_ok=True)
+        names = []
+        for root, _, files in os.walk(tmp):
+            if "obj.names" in files:
+                with open(os.path.join(root, "obj.names")) as fh:
+                    names = [ln.strip() for ln in fh if ln.strip()]
+                break
+        if names:
+            with open(os.path.join(out_dir, "labels.txt"), "w") as fh:
+                fh.write("\n".join(names) + "\n")
+        frames = {}       # image basename -> frame path inside obj_<subset>_data
+        subset = None
+        n = 0
+        for root, _, files in os.walk(tmp):
+            for f in files:
+                if os.path.splitext(f)[1].lower() not in (".jpg", ".jpeg", ".png"):
+                    continue
+                full = os.path.join(root, f)
+                parts = os.path.relpath(full, tmp).split(os.sep)
+                frame = f
+                for i, p in enumerate(parts):
+                    pl = p.lower()
+                    if pl.startswith("obj_") and pl.endswith("_data"):
+                        if subset is None:
+                            subset = p[4:-5]           # 'obj_Train_data' -> 'Train'
+                        frame = "/".join(parts[i + 1:])
+                        break
+                shutil.copy(full, os.path.join(img_out, f))
+                stem = os.path.splitext(f)[0]
+                lp = os.path.join(root, os.path.splitext(os.path.basename(full))[0] + ".txt")
+                if os.path.exists(lp):
+                    shutil.copy(lp, os.path.join(lbl_out, stem + ".txt"))
+                frames[f] = frame
+                n += 1
+        return n, names, frames, subset
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def _cvat_session():
+    """Authenticated requests session (org-scoped). The REST export API is more
+    reliable across server versions than the SDK's export_dataset()."""
+    import requests
+    if not (CVAT_URL and CVAT_USER and CVAT_PASS):
+        raise RuntimeError("CVAT credentials missing in .env")
+    s = requests.Session()
+    if CVAT_ORG:
+        s.headers.update({"X-Organization": CVAT_ORG})
+    s.headers.update({"Referer": CVAT_URL})
+    r = s.post(f"{CVAT_URL}/api/auth/login",
+               json={"username": CVAT_USER, "password": CVAT_PASS},
+               headers={"Content-Type": "application/json"})
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"CVAT login failed: {r.status_code}")
+    csrf = s.cookies.get("csrftoken")
+    if csrf:
+        s.headers.update({"X-CSRFToken": csrf})
+    return s
+
+
+def _cvat_export_task(session, task_id, zip_path):
+    """Export a task as 'YOLO 1.1' with images and download the zip."""
+    import time
+    # location=local is required for app.cvat.ai to populate result_url
+    r = session.post(f"{CVAT_URL}/api/tasks/{task_id}/dataset/export",
+                     params={"format": "YOLO 1.1", "save_images": "true",
+                             "location": "local"})
+    if r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"export init failed {r.status_code}: {r.text[:160]}")
+    rq_id = r.json().get("rq_id")
+    if not rq_id:
+        raise RuntimeError(f"no rq_id from export: {r.text[:160]}")
+    waited = 0
+    while waited < 1800:
+        st = session.get(f"{CVAT_URL}/api/requests/{rq_id}").json()
+        status = (st.get("status") or "").lower()
+        if status == "finished":
+            url = st.get("result_url")
+            if not url:
+                raise RuntimeError("export finished but no result_url")
+            if not url.startswith("http"):
+                url = f"{CVAT_URL}{url}"
+            resp = session.get(url, stream=True)
+            if resp.status_code != 200:
+                raise RuntimeError(f"download failed {resp.status_code}")
+            with open(zip_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1 << 16):
+                    f.write(chunk)
+            return
+        if status == "failed":
+            raise RuntimeError(f"export failed: {st.get('message')}")
+        time.sleep(3)
+        waited += 3
+    raise RuntimeError("export timed out")
+
+
+def _do_cvat_import(task_id):
+    import tempfile
+    import shutil
+    zip_path = None
+    try:
+        _set_imp(state="exporting", message="connecting to CVAT…")
+        session = _cvat_session()
+        info = session.get(f"{CVAT_URL}/api/tasks/{task_id}").json()
+        tname = info.get("name") or f"task_{task_id}"
+        fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_task_")
+        os.close(fd)
+        _set_imp(message=f"exporting '{tname}' (images + annotations)…")
+        _cvat_export_task(session, task_id, zip_path)
+        out_dir = os.path.join(IMPORTS_DIR, f"{task_id}_{_safe_name(tname)}")
+        if os.path.isdir(out_dir):
+            shutil.rmtree(out_dir, ignore_errors=True)
+        os.makedirs(out_dir, exist_ok=True)
+        _set_imp(message="extracting…")
+        n, names, frames, subset = _extract_yolo_export(zip_path, out_dir)
+        # remember which CVAT task this folder came from (plus the frame paths /
+        # subset) so uploading can update the SAME task's annotations.
+        try:
+            with open(os.path.join(out_dir, ".cvat_task.json"), "w") as fh:
+                json.dump({"task_id": int(task_id), "task_name": tname,
+                           "project_id": info.get("project_id"),
+                           "frames": frames, "subset": subset}, fh)
+        except OSError:
+            pass
+        _set_imp(running=False, state="done", path=out_dir, count=n,
+                 message=f"imported {n} images, {len(names)} classes ✓")
+    except Exception as e:
+        _set_imp(running=False, state="error", error=str(e),
+                 message=f"import failed: {e}")
+    finally:
+        if zip_path and os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+
+@app.route("/api/cvat/import", methods=["POST"])
+def api_cvat_import():
+    data = request.get_json(force=True)
+    task_id = data.get("task_id")
+    if not task_id:
+        return jsonify({"error": "no task selected"}), 400
+    if not (CVAT_URL and CVAT_USER and CVAT_PASS):
+        return jsonify({"error": "CVAT credentials missing in .env"}), 400
+    with _imp_lock:
+        if _imp_job["running"]:
+            return jsonify({"error": "an import is already running"}), 409
+        _imp_job.update(running=True, state="starting", message="starting…",
+                        path=None, count=0, error=None)
+    threading.Thread(target=_do_cvat_import, args=(task_id,), daemon=True).start()
+    return jsonify({"started": True})
+
+
+@app.route("/api/cvat/importstatus")
+def api_cvat_importstatus():
+    with _imp_lock:
+        return jsonify(dict(_imp_job))
 
 
 # --------------------------------------------------------------------------- #
@@ -668,21 +994,28 @@ HTML = r"""<!DOCTYPE html>
   .lp-row{display:flex;gap:6px;margin-bottom:6px;}
   .lp-row:last-child{margin-bottom:0;}
   .lp-row input[type=number]{width:auto;flex:1;min-width:0;margin-bottom:0;}
-  #left .lp-row select{width:52px;flex:none;}
   .lp-row button{flex:none;}
   .lp-row button.grow{flex:1;min-width:0;}
-  #left button{background:#3a3a3a;color:#eee;border:1px solid #555;padding:6px 10px;
+  .lp-sec button{background:#3a3a3a;color:#eee;border:1px solid #555;padding:6px 10px;
      border-radius:5px;cursor:pointer;font-size:13px;white-space:nowrap;}
-  #left button:hover{background:#474747;}
-  #left button.wide{display:block;width:100%;margin-bottom:6px;box-sizing:border-box;}
-  #left button.wide:last-child{margin-bottom:0;}
-  #left button.grow{flex:1;}
-  #left button.danger{background:#5a2a2a;border-color:#733;}
-  #left button.danger:hover{background:#7a3030;}
-  #left button.ok{background:#2a4a2a;border-color:#3a6a3a;}
-  #left button.ok:hover{background:#356a35;}
-  #left select{width:100%;box-sizing:border-box;padding:6px;background:#1b1b1b;
+  .lp-sec button:hover{background:#474747;}
+  .lp-sec button.wide{display:block;width:100%;margin-bottom:6px;box-sizing:border-box;}
+  .lp-sec button.wide:last-child{margin-bottom:0;}
+  .lp-sec button.grow{flex:1;}
+  .lp-sec button.danger{background:#5a2a2a;border-color:#733;}
+  .lp-sec button.danger:hover{background:#7a3030;}
+  .lp-sec button.ok{background:#2a4a2a;border-color:#3a6a3a;}
+  .lp-sec button.ok:hover{background:#356a35;}
+  .lp-sec select{width:100%;box-sizing:border-box;padding:6px;background:#1b1b1b;
      color:#eee;border:1px solid #555;border-radius:5px;font-size:14px;}
+  /* per-class visibility rows */
+  #visiblelist{display:flex;flex-direction:column;gap:2px;max-height:230px;overflow:auto;}
+  .vis-row{display:flex;align-items:center;gap:7px;padding:3px 4px;cursor:pointer;
+           font-size:12px;border-radius:4px;}
+  .vis-row:hover{background:#2e2e2e;}
+  .vis-row input{accent-color:#49a05f;width:14px;height:14px;margin:0;cursor:pointer;flex:none;}
+  .vis-row .sw{width:12px;height:12px;border-radius:3px;border:1px solid #000;flex:none;}
+  .vis-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .lp-toggles{display:flex;flex-direction:column;gap:6px;}
   .toggle{display:inline-flex;align-items:center;gap:6px;padding:6px 11px;
           border-radius:16px;background:#333;border:1px solid #555;cursor:pointer;
@@ -713,16 +1046,15 @@ HTML = r"""<!DOCTYPE html>
   #help{font-size:11px;color:#888;padding:4px 12px;background:#252525;flex:none;}
   /* radial class picker overlay (covers viewport, never eats mouse events) */
   #radial{position:fixed;inset:0;z-index:50;display:none;pointer-events:none;}
-  #cvatstatus,#aastatus{font-size:11px;color:#9ab;margin-top:6px;word-break:break-word;line-height:1.4;}
-  #cvatUpBtn:disabled{opacity:.5;cursor:default;}
+  #cvatstatus{font-size:11px;color:#9ab;margin-top:6px;word-break:break-word;line-height:1.4;}
   /* CVAT project dropdown should fill the row (beat the 52px filter-select rule) */
-  #left .lp-row #cvatproj{flex:1;width:auto;min-width:0;}
+  .lp-row #cvatproj{flex:1;width:auto;min-width:0;}
   #cvatproj:disabled{opacity:.75;}
   /* minimal icon-only lock: no button chrome, colour reflects state */
-  #left .lockbtn{flex:none;width:30px;padding:0 2px;background:none;border:none;
+  .lp-sec .lockbtn{flex:none;width:30px;padding:0 2px;background:none;border:none;
                  color:#7a7a7a;cursor:pointer;display:flex;align-items:center;justify-content:center;}
-  #left .lockbtn:hover{background:none;color:#aaa;}
-  #left .lockbtn.on{color:#49a05f;}
+  .lp-sec .lockbtn:hover{background:none;color:#aaa;}
+  .lp-sec .lockbtn.on{color:#49a05f;}
   /* automatic-annotation modal + progress */
   .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;
             display:none;align-items:center;justify-content:center;}
@@ -742,8 +1074,13 @@ HTML = r"""<!DOCTYPE html>
   .modal-f button:disabled{opacity:.5;cursor:default;}
   .bar{height:12px;background:#333;border-radius:6px;overflow:hidden;margin:6px 0 10px;}
   .bar>div{height:100%;width:0;background:#49a05f;transition:width .25s;}
-  #aaprogtext{font-size:12px;color:#cde;}
+  /* indeterminate (CVAT upload has no % — show a moving stripe) */
+  .bar.indet>div{width:35%;transition:none;animation:indet 1.1s ease-in-out infinite;}
+  @keyframes indet{0%{margin-left:-35%}100%{margin-left:100%}}
+  #aaprogtext,#cvprogtext,#impprogtext{font-size:12px;color:#cde;}
   .aamsg{font-size:11px;color:#e9a;min-height:14px;}
+  .cvtarget{font-size:13px;color:#cde;background:#1b1b1b;border:1px solid #555;
+            border-radius:5px;padding:7px;word-break:break-word;}
 </style>
 </head>
 <body>
@@ -776,14 +1113,33 @@ HTML = r"""<!DOCTYPE html>
       <select id="classsel" onchange="setActiveClass(parseInt(this.value,10))"></select>
     </div>
     <div class="lp-sec">
-      <h4><label class="tick"><input type="checkbox" id="boxon" onchange="onFilterChange(true)"> Filter by box count</label></h4>
-      <div class="lp-row">
-        <select id="filterop" title="box count comparator" onchange="onFilterChange(true)">
-          <option value="gt">&gt;</option><option value="lt">&lt;</option><option value="eq">=</option>
-        </select>
-        <input id="minann" type="number" min="0" placeholder="count" oninput="boxInput()">
+      <h4>Visible labels</h4>
+      <div class="lp-row" style="margin-bottom:6px;">
+        <button class="grow" onclick="setAllVisible(true)">All</button>
+        <button class="grow" onclick="setAllVisible(false)">None</button>
       </div>
+      <div id="visiblelist"></div>
     </div>
+    <div class="lp-sec">
+      <h4>Automatic annotation</h4>
+      <button class="wide ok" onclick="openAaModal()">Automatic annotation…</button>
+    </div>
+    <div class="lp-sec">
+      <h4>CVAT project</h4>
+      <div class="lp-row">
+        <select id="cvatproj" onchange="onCvatProjPick()"><option value="">— loading projects… —</option></select>
+        <button id="cvatlock" class="lockbtn" title="lock project" onclick="toggleCvatLock()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.5"/></svg></button>
+      </div>
+      <button class="wide" onclick="loadCvatProjects()">Refresh list</button>
+      <button class="wide" onclick="openImpModal()">Import from CVAT…</button>
+      <button class="wide ok" onclick="openCvModal()">Upload to CVAT…</button>
+      <div id="cvatstatus"></div>
+    </div>
+  </div>
+
+  <div id="wrap"><canvas id="cv"></canvas></div>
+
+  <div id="panel">
     <div class="lp-sec">
       <h4>Tools</h4>
       <div class="lp-toggles">
@@ -797,31 +1153,8 @@ HTML = r"""<!DOCTYPE html>
         <button class="grow danger" onclick="clearAll()">Clear all</button>
       </div>
       <button class="wide ok" onclick="save()">Save (S)</button>
-      <button class="wide" id="panelBtn" onclick="togglePanel()">Hide list</button>
+      <button class="wide danger" onclick="deleteImage()">Delete this image</button>
     </div>
-    <div class="lp-sec">
-      <h4>Automatic annotation</h4>
-      <button class="wide ok" onclick="openAaModal()">Automatic annotation…</button>
-    </div>
-    <div class="lp-sec">
-      <h4>CVAT project</h4>
-      <div class="lp-row">
-        <select id="cvatproj" onchange="onCvatProjPick()"><option value="">— loading projects… —</option></select>
-        <button id="cvatlock" class="lockbtn" title="lock project" onclick="toggleCvatLock()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.5"/></svg></button>
-      </div>
-      <button class="wide" onclick="loadCvatProjects()">Refresh list</button>
-    </div>
-    <div class="lp-sec">
-      <h4>Upload to CVAT</h4>
-      <input id="cvattask" type="text" placeholder="task name">
-      <button class="wide ok" id="cvatUpBtn" onclick="cvatUpload()">Upload this folder</button>
-      <div id="cvatstatus"></div>
-    </div>
-  </div>
-
-  <div id="wrap"><canvas id="cv"></canvas></div>
-
-  <div id="panel">
     <h3>Boxes &mdash; class &amp; delete</h3>
     <div id="list"></div>
   </div>
@@ -859,10 +1192,62 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="cvmodal" class="modal-bg">
+  <div class="modal">
+    <div class="modal-h">Upload to CVAT</div>
+    <div class="modal-body">
+      <div id="cvcfg">
+        <div id="cvlinkwrap" style="display:none;">
+          <label class="tick" style="margin-bottom:8px;"><input type="checkbox" id="cvupdate" checked onchange="cvUpdateToggle()"> Update source task <b id="cvlinkedname"></b></label>
+        </div>
+        <div id="cvnewwrap">
+          <label>Project</label>
+          <div id="cvtarget" class="cvtarget">— select a project in the sidebar —</div>
+          <label>Task name</label>
+          <input id="cvattask" type="text" placeholder="task name">
+        </div>
+      </div>
+      <div id="cvprog" style="display:none;">
+        <div class="bar indet" id="cvbarwrap"><div id="cvbar"></div></div>
+        <div id="cvprogtext"></div>
+      </div>
+      <div id="cvmsg" class="aamsg"></div>
+    </div>
+    <div class="modal-f">
+      <button id="cvcancel" onclick="closeCvModal()">Cancel</button>
+      <button id="cvrun" class="ok" onclick="runCvatUpload()">Upload</button>
+    </div>
+  </div>
+</div>
+
+<div id="impmodal" class="modal-bg">
+  <div class="modal">
+    <div class="modal-h">Import from CVAT</div>
+    <div class="modal-body">
+      <div id="impcfg">
+        <label>Project</label>
+        <select id="impproj" onchange="loadImpTasks()"><option value="">— select project —</option></select>
+        <label>Task</label>
+        <select id="imptask"><option value="">— select a project first —</option></select>
+      </div>
+      <div id="impprog" style="display:none;">
+        <div class="bar indet" id="impbarwrap"><div id="impbar"></div></div>
+        <div id="impprogtext"></div>
+      </div>
+      <div id="impmsg" class="aamsg"></div>
+    </div>
+    <div class="modal-f">
+      <button id="impcancel" onclick="closeImpModal()">Cancel</button>
+      <button id="imprun" class="ok" onclick="runCvatImport()">Import</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let idx = 0, count = 0, name = "";
 let classes = [];        // class names from labels.txt; index = class id
 let activeClass = 0;     // class assigned to NEW boxes
+let hiddenClasses = new Set();   // class ids hidden from the canvas (view filter)
 let boxes = [];          // editable boxes for THIS image (seeded from the file)
 let origBoxes = [];      // on-disk snapshot at load time (reference only)
 let img = new Image();
@@ -890,12 +1275,7 @@ function setStatus(t, cls){ const s=document.getElementById('status');
 function markDirty(d){ dirty=d;
   document.getElementById('name').className = d ? 'dirty' : ''; }
 function updateName(){
-  let suffix='';
-  if(filterList){
-    const p=filterList.indexOf(idx);
-    suffix='  •  filtered '+(p<0?'?':p+1)+'/'+filterList.length;
-  }
-  document.getElementById('name').textContent = '['+(idx+1)+'/'+count+'] '+name+suffix;
+  document.getElementById('name').textContent = '['+(idx+1)+'/'+count+'] '+name;
   updateNav();
 }
 // keep the top scrubber + position label in sync with the current image
@@ -914,7 +1294,30 @@ function buildClassUI(){
     : '<option value="0">0: class 0</option>';
   const names = classes.length ? classes : ['class 0'];
   if(activeClass>=names.length) activeClass=0;
+  hiddenClasses.clear();           // a new class set starts all-visible
+  buildVisibleUI();
   setActiveClass(activeClass);
+}
+// per-class show/hide checkboxes
+function buildVisibleUI(){
+  const el=document.getElementById('visiblelist');
+  if(!el) return;
+  const names = classes.length ? classes : ['class 0'];
+  el.innerHTML = names.map((n,i)=>
+    '<label class="vis-row"><input type="checkbox" '+(hiddenClasses.has(i)?'':'checked')
+    +' onchange="toggleClassVis('+i+',this.checked)">'
+    +'<span class="sw" style="background:'+classColor(i)+'"></span>'
+    +'<span class="vis-name">'+escapeHtml(n)+'</span></label>').join('');
+}
+function toggleClassVis(i, on){
+  if(on) hiddenClasses.delete(i); else hiddenClasses.add(i);
+  draw();
+}
+function setAllVisible(on){
+  const names = classes.length ? classes : ['class 0'];
+  hiddenClasses.clear();
+  if(!on) for(let i=0;i<names.length;i++) hiddenClasses.add(i);
+  buildVisibleUI(); draw();
 }
 function setActiveClass(i){
   if(i<0) return;
@@ -989,6 +1392,7 @@ function draw(){
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.drawImage(img,0,0,cv.width,cv.height);
   boxes.forEach((b,i)=>{
+    if(hiddenClasses.has(b.cls)) return;    // class hidden by the visibility filter
     const p=toPix(b);
     const col = classColor(b.cls);          // box colour always matches its class
     ctx.lineWidth = (i===sel)?3:1.5;         // selection shown by a thicker border + handles
@@ -1037,12 +1441,21 @@ function removeBox(i){
   touched=true; markDirty(true); draw(); maybeAutosave();
 }
 
-let panelOn=true;
-function togglePanel(){
-  panelOn=!panelOn;
-  document.getElementById('panel').style.display = panelOn?'block':'none';
-  document.getElementById('panelBtn').textContent = panelOn?'Hide list':'Show list';
-  fit(); draw();
+// delete the current image (and its label) from disk, then advance
+async function deleteImage(){
+  if(!count){ setStatus('no image to delete'); return; }
+  if(!confirm('Delete image "'+name+'" and its label from disk?\\nThis cannot be undone.')) return;
+  const di=idx;
+  touched=false; markDirty(false);     // don't autosave the image we're deleting
+  try{
+    const r=await fetch('/api/delete/'+di,{method:'POST'}).then(r=>r.json());
+    if(r.error){ setStatus('error: '+r.error); return; }
+    count=r.count;
+    setStatus('deleted '+r.deleted);
+    if(!count){ name=''; boxes=[]; origBoxes=[]; sel=-1; updateName();
+      const ctx2=cv.getContext('2d'); ctx2.clearRect(0,0,cv.width,cv.height); return; }
+    load(Math.min(di, count-1));        // lands on the next image (or last)
+  }catch(e){ setStatus('delete request failed'); }
 }
 
 function drawHandles(p){
@@ -1079,6 +1492,7 @@ cv.addEventListener('mousedown', e=>{
   const m=mousePos(e);
   if(e.button===2){
     for(let i=boxes.length-1;i>=0;i--){
+      if(hiddenClasses.has(boxes[i].cls)) continue;
       if(inside(toPix(boxes[i]),m)){
         boxes.splice(i,1);
         if(sel===i) sel=-1; else if(sel>i) sel--;
@@ -1095,6 +1509,7 @@ cv.addEventListener('mousedown', e=>{
     if(h){ drag={mode:'resize', box:sel, handle:h, orig:{...p}}; return; }
   }
   for(let i=boxes.length-1;i>=0;i--){
+    if(hiddenClasses.has(boxes[i].cls)) continue;
     if(inside(toPix(boxes[i]),m)){
       sel=i; drag={mode:'move', box:i, startX:m.x, startY:m.y, orig:toPix(boxes[i])};
       setActiveClassSilent(boxes[i].cls);
@@ -1160,6 +1575,8 @@ window.addEventListener('mouseup', e=>{
     if(c.w>3 && c.h>3){
       boxes.push(fromPix(c.x,c.y,c.w,c.h,activeClass));   // new box -> active class
       sel=boxes.length-1; touched=true; markDirty(true);
+      // don't let a freshly drawn box be invisible because its class is hidden
+      if(hiddenClasses.has(activeClass)){ hiddenClasses.delete(activeClass); buildVisibleUI(); }
     }
   }
   drag=null; draw();
@@ -1186,12 +1603,6 @@ async function save(){
     body:JSON.stringify({boxes})}).then(r=>r.json());
   markDirty(false);
   setStatus('saved '+r.n+' box(es) ✓');
-  syncFilterAfterSave(r.n);
-}
-function syncFilterAfterSave(n){
-  if(!anyFilterOn()) return;
-  clearTimeout(filterTimer);
-  filterTimer=setTimeout(()=>applyFilters(false), 400);
 }
 
 async function loadFolder(){
@@ -1202,9 +1613,9 @@ async function loadFolder(){
     body:JSON.stringify({path})}).then(r=>r.json());
   if(r.error){ setStatus('error: '+r.error); return; }
   count=r.count; classes=r.classes||[]; activeClass=0;
+  linkedTask=r.linked_task||null;
   buildClassUI();
   setStatus('loaded '+r.count+' images, '+classes.length+' classes from '+r.path);
-  filterList=null;
   if(count) load(0); else { name=''; updateName(); }
 }
 
@@ -1283,6 +1694,7 @@ function pollAutoAnnotate(){
 
 // ---- CVAT upload ----
 let cvatLocked=false;
+let linkedTask=null;     // {task_id,task_name,project_id} if this folder was imported
 const LOCK_OPEN='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.5"/></svg>';
 const LOCK_SHUT='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
 function setCvatStatus(t){ document.getElementById('cvatstatus').textContent=t; }
@@ -1334,44 +1746,197 @@ async function fetchCvatClasses(){
 function onCvatProjPick(){
   if(document.getElementById('cvatproj').value) fetchCvatClasses();
 }
+// ---- CVAT upload modal + progress ----
 let cvatPoll=null;
-async function cvatUpload(){
-  const pid=document.getElementById('cvatproj').value;
-  const tname=document.getElementById('cvattask').value.trim();
-  if(!pid){ setCvatStatus('select a project'); return; }
-  if(!tname){ setCvatStatus('enter a task name'); return; }
-  if(!confirm('Upload all '+count+' images from this folder to CVAT project '
-              +pid+' as task "'+tname+'"?')) return;
-  const btn=document.getElementById('cvatUpBtn');
-  btn.disabled=true; setCvatStatus('starting upload…');
+function cvMsg(t){ const e=document.getElementById('cvmsg'); if(e) e.textContent=t||''; }
+function cvProgText(t){ const e=document.getElementById('cvprogtext'); if(e) e.textContent=t||''; }
+function cvIndet(on){
+  const w=document.getElementById('cvbarwrap'), b=document.getElementById('cvbar');
+  if(on){ w.classList.add('indet'); b.style.width=''; b.style.marginLeft=''; }
+  else { w.classList.remove('indet'); b.style.marginLeft='0'; b.style.width='100%'; }
+}
+function showCvConfig(){
+  document.getElementById('cvcfg').style.display='block';
+  document.getElementById('cvprog').style.display='none';
+  const run=document.getElementById('cvrun'); run.style.display=''; run.disabled=false;
+  document.getElementById('cvcancel').textContent='Cancel';
+  cvProgText('');
+}
+function showCvProgress(){
+  document.getElementById('cvcfg').style.display='none';
+  document.getElementById('cvprog').style.display='block';
+  document.getElementById('cvrun').style.display='none';
+  document.getElementById('cvcancel').textContent='Close';
+}
+// updating an imported task hides the "create new" fields
+function cvUpdateToggle(){
+  const upd = linkedTask && document.getElementById('cvupdate').checked;
+  document.getElementById('cvnewwrap').style.display = upd ? 'none' : 'block';
+  updateCvRunState();
+}
+function updateCvRunState(){
+  const run=document.getElementById('cvrun');
+  if(linkedTask && document.getElementById('cvupdate').checked){ run.disabled=false; cvMsg(''); return; }
+  const sel=document.getElementById('cvatproj');
+  if(sel.value){ run.disabled=false; cvMsg(''); }
+  else { run.disabled=true; cvMsg('pick a CVAT project on the left first'); }
+}
+async function openCvModal(){
+  document.getElementById('cvmodal').style.display='flex';
+  cvMsg(''); showCvConfig();
+  // linked-task (imported folder) option
+  const lw=document.getElementById('cvlinkwrap');
+  if(linkedTask){
+    lw.style.display='block';
+    document.getElementById('cvlinkedname').textContent='#'+linkedTask.task_id
+      +(linkedTask.task_name?(' ('+linkedTask.task_name+')'):'');
+    document.getElementById('cvupdate').checked=true;
+  } else lw.style.display='none';
+  // reflect the project chosen in the sidebar (for create-new)
+  const sel=document.getElementById('cvatproj');
+  const tgt=document.getElementById('cvtarget');
+  tgt.textContent = sel.value ? sel.options[sel.selectedIndex].text
+                              : '— select a project in the sidebar —';
+  cvUpdateToggle();
+  // if an upload is already running, jump straight to its progress
+  try{
+    const s=await fetch('/api/cvat/uploadstatus?t='+Date.now()).then(r=>r.json());
+    if(s.running){ showCvProgress(); cvIndet(true); pollCvatUpload(); }
+  }catch(e){}
+}
+function closeCvModal(){ document.getElementById('cvmodal').style.display='none'; }
+async function runCvatUpload(){
+  const updating = linkedTask && document.getElementById('cvupdate').checked;
+  let body;
+  if(updating){
+    body={task_id:linkedTask.task_id, classes};
+  } else {
+    const pid=document.getElementById('cvatproj').value;
+    const tname=document.getElementById('cvattask').value.trim();
+    if(!pid){ cvMsg('select a project in the sidebar'); return; }
+    if(!tname){ cvMsg('enter a task name'); return; }
+    body={project_id:pid, task_name:tname, classes};
+  }
+  cvMsg(''); showCvProgress(); cvIndet(true);
+  cvProgText(updating ? ('updating annotations on task #'+linkedTask.task_id+'…')
+                      : ('starting upload of '+count+' images…'));
   try{
     const r=await fetch('/api/cvat/upload',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({project_id:pid, task_name:tname, classes})}).then(r=>r.json());
-    if(r.error){ setCvatStatus('error: '+r.error); btn.disabled=false; return; }
-    setCvatStatus('uploading '+r.count+' images'+(r.annotations?' + annotations':'')+'…');
-    pollCvat();
-  }catch(e){ setCvatStatus('request failed'); btn.disabled=false; }
+      body:JSON.stringify(body)}).then(r=>r.json());
+    if(r.error){ cvProgText('error: '+r.error); cvIndet(false); return; }
+    cvProgText(updating ? 'uploading annotations…'
+      : ('uploading '+r.count+' images'+(r.annotations?' + annotations':'')+'…'));
+    pollCvatUpload();
+  }catch(e){ cvProgText('request failed'); cvIndet(false); }
 }
-function pollCvat(){
+function pollCvatUpload(){
   clearInterval(cvatPoll);
   cvatPoll=setInterval(async()=>{
     let s; try{ s=await fetch('/api/cvat/uploadstatus?t='+Date.now()).then(r=>r.json()); }
     catch(e){ return; }
-    setCvatStatus(s.message||s.state||'');
+    cvProgText(s.message||s.state||'');
     if(!s.running){
       clearInterval(cvatPoll);
-      document.getElementById('cvatUpBtn').disabled=false;
-      if(s.error) setCvatStatus('failed: '+s.error);
-      else if(s.task_id) setCvatStatus('done ✓ — task '+s.task_id
+      cvIndet(false);
+      document.getElementById('cvcancel').textContent='Done';
+      if(s.error) cvProgText('failed: '+s.error);
+      else if(s.task_id) cvProgText('done ✓ — task '+s.task_id
         +(s.task_url?' ('+s.task_url+')':''));
     }
   }, 1500);
 }
 
-let filterList=null;
-let filterPos=0;
-let filterTimer=null;
+// ---- CVAT import modal + progress ----
+let impPoll=null;
+function impMsg(t){ const e=document.getElementById('impmsg'); if(e) e.textContent=t||''; }
+function impProgText(t){ const e=document.getElementById('impprogtext'); if(e) e.textContent=t||''; }
+function impIndet(on){
+  const w=document.getElementById('impbarwrap'), b=document.getElementById('impbar');
+  if(on){ w.classList.add('indet'); b.style.width=''; b.style.marginLeft=''; }
+  else { w.classList.remove('indet'); b.style.marginLeft='0'; b.style.width='100%'; }
+}
+function showImpConfig(){
+  document.getElementById('impcfg').style.display='block';
+  document.getElementById('impprog').style.display='none';
+  const run=document.getElementById('imprun'); run.style.display=''; run.disabled=false;
+  document.getElementById('impcancel').textContent='Cancel';
+  impProgText('');
+}
+function showImpProgress(){
+  document.getElementById('impcfg').style.display='none';
+  document.getElementById('impprog').style.display='block';
+  document.getElementById('imprun').style.display='none';
+  document.getElementById('impcancel').textContent='Close';
+}
+async function openImpModal(){
+  document.getElementById('impmodal').style.display='flex';
+  impMsg(''); showImpConfig();
+  document.getElementById('imptask').innerHTML='<option value="">— select a project first —</option>';
+  loadImpProjects();
+  // if an import is already running, jump to its progress
+  try{
+    const s=await fetch('/api/cvat/importstatus?t='+Date.now()).then(r=>r.json());
+    if(s.running){ showImpProgress(); impIndet(true); pollCvatImport(); }
+  }catch(e){}
+}
+function closeImpModal(){ document.getElementById('impmodal').style.display='none'; }
+async function loadImpProjects(){
+  const sel=document.getElementById('impproj');
+  sel.innerHTML='<option value="">loading…</option>';
+  try{
+    const r=await fetch('/api/cvat/projects?t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; impMsg('error: '+r.error); return; }
+    sel.innerHTML='<option value="">— select project —</option>'
+      +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; impMsg('project list failed'); }
+}
+async function loadImpTasks(){
+  const pid=document.getElementById('impproj').value;
+  const sel=document.getElementById('imptask');
+  if(!pid){ sel.innerHTML='<option value="">— select a project first —</option>'; return; }
+  sel.innerHTML='<option value="">loading tasks…</option>';
+  try{
+    const r=await fetch('/api/cvat/tasks?project_id='+encodeURIComponent(pid)+'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; impMsg('error: '+r.error); return; }
+    if(!r.tasks.length){ sel.innerHTML='<option value="">no tasks in this project</option>'; return; }
+    sel.innerHTML='<option value="">— select task —</option>'
+      +r.tasks.map(t=>'<option value="'+t.id+'">'+t.id+' — '+escapeHtml(t.name)
+        +(t.size!=null?(' ('+t.size+' imgs)'):'')+'</option>').join('');
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; impMsg('task list failed'); }
+}
+async function runCvatImport(){
+  const task=document.getElementById('imptask').value;
+  if(!task){ impMsg('select a task'); return; }
+  impMsg(''); showImpProgress(); impIndet(true);
+  impProgText('starting import…');
+  try{
+    const r=await fetch('/api/cvat/import',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task_id:task})}).then(r=>r.json());
+    if(r.error){ impProgText('error: '+r.error); impIndet(false); return; }
+    pollCvatImport();
+  }catch(e){ impProgText('request failed'); impIndet(false); }
+}
+function pollCvatImport(){
+  clearInterval(impPoll);
+  impPoll=setInterval(async()=>{
+    let s; try{ s=await fetch('/api/cvat/importstatus?t='+Date.now()).then(r=>r.json()); }
+    catch(e){ return; }
+    impProgText(s.message||s.state||'');
+    if(!s.running){
+      clearInterval(impPoll);
+      impIndet(false);
+      document.getElementById('impcancel').textContent='Done';
+      if(s.error){ impProgText('failed: '+s.error); return; }
+      if(s.path){
+        impProgText('imported '+s.count+' images ✓ — opening folder…');
+        document.getElementById('folder').value=s.path;
+        loadFolder();                                  // switch the app to the imported folder
+      }
+    }
+  }, 1200);
+}
 
 async function saveIfDirty(){
   if(touched){
@@ -1386,21 +1951,8 @@ async function navTo(i){
 }
 async function go(d){
   await saveIfDirty();
-  if(filterList){
-    let target;
-    if(d>0) target = filterList.find(i => i > idx);
-    else { const before=filterList.filter(i => i < idx);
-           target = before.length ? before[before.length-1] : undefined; }
-    if(target===undefined){
-      setStatus(d>0 ? 'no more filtered images after this'
-                    : 'no filtered images before this');
-      return;
-    }
-    load(target);
-  } else {
-    const t=idx+d;
-    if(t>=0 && t<count) load(t);
-  }
+  const t=idx+d;
+  if(t>=0 && t<count) load(t);
 }
 function jump(){
   const v=parseInt(document.getElementById('jump').value,10);
@@ -1433,38 +1985,6 @@ async function pumpScrub(){
       await load(t);
     }
   } finally { scrubBusy=false; }
-}
-
-function sym(op){ return op==='lt'?'<':op==='eq'?'=':'>'; }
-function anyFilterOn(){ return document.getElementById('boxon').checked; }
-function boxInput(){
-  const v=document.getElementById('minann').value.trim();
-  document.getElementById('boxon').checked = v!=='';
-  onFilterChange(true);
-}
-function onFilterChange(navigate){
-  clearTimeout(filterTimer);
-  filterTimer=setTimeout(()=>applyFilters(!!navigate), 220);
-}
-async function applyFilters(navigate){
-  const boxon=document.getElementById('boxon').checked;
-  if(!boxon){ filterList=null; filterPos=0; updateName();
-    setStatus('showing all images'); return; }
-  const bop=document.getElementById('filterop').value;
-  const bn=parseInt(document.getElementById('minann').value,10)||0;
-  const cur=idx;
-  const q='op='+bop+'&n='+bn+'&t='+Date.now();
-  const r=await fetch('/api/filter?'+q).then(r=>r.json());
-  filterList=r.indices;
-  const desc='boxes '+sym(bop)+' '+bn;
-  if(!filterList.length){ setStatus('no images match '+desc); updateName(); return; }
-  setStatus(filterList.length+' match '+desc);
-  if(navigate){
-    let p=filterList.findIndex(i=>i>=cur);
-    if(p<0) p=filterList.length-1;
-    filterPos=p;
-    if(filterList[p]!==idx) navTo(filterList[p]); else updateName();
-  } else updateName();
 }
 
 /* ---------------- radial class picker (hold C) ---------------- */
@@ -1620,7 +2140,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
 
 (async()=>{
   const m=await fetch('/api/meta').then(r=>r.json());
-  count=m.count; classes=m.classes||[];
+  count=m.count; classes=m.classes||[]; linkedTask=m.linked_task||null;
   document.getElementById('folder').value = m.path || '';
   buildClassUI();
   updateNav();
