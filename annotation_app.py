@@ -847,7 +847,8 @@ def api_cvat_importstatus():
 # Auto-annotation pipeline: import task -> run model -> update CVAT
 # --------------------------------------------------------------------------- #
 _ap_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
-           "task_id": None, "task_url": None, "added": 0, "error": None}
+           "cur_task": 0, "n_tasks": 0, "task_id": None, "task_url": None,
+           "added": 0, "done_tasks": 0, "error": None}
 _ap_lock = threading.Lock()
 
 
@@ -856,13 +857,14 @@ def _set_ap(**kw):
         _ap_job.update(kw)
 
 
-def _do_cvat_autopipeline(task_id, model_path, conf, mode, name_mapping):
+def _autopipeline_one(task_id, model_path, conf, mode, name_mapping, label):
+    """Import one task, run the model, and push annotations back. Returns the
+    number of boxes added. `label` prefixes progress messages (e.g. 'task 2/5')."""
     import tempfile
     zip_path = None
     try:
-        # 1) import the task locally
-        _set_ap(state="importing", message="importing task…")
-        r = _cvat_import_task(task_id, status=lambda m: _set_ap(message="import: " + m))
+        _set_ap(state="importing", message=f"{label}: importing…")
+        r = _cvat_import_task(task_id, status=lambda m: _set_ap(message=f"{label} import: {m}"))
         out_dir = r["out_dir"]
         classes = r["classes"]
         frames = r["frames"]
@@ -871,8 +873,7 @@ def _do_cvat_autopipeline(task_id, model_path, conf, mode, name_mapping):
         lbl_dir = os.path.join(out_dir, "labels")
         images = sorted(os.listdir(img_dir)) if os.path.isdir(img_dir) else []
         if not classes:
-            raise RuntimeError("task has no classes (labels.txt)")
-        # resolve model class index -> here class index (mapping value = class name)
+            raise RuntimeError(f"task {task_id} has no classes (labels.txt)")
         name_to_idx = {str(n).strip().lower(): i for i, n in enumerate(classes)}
         idx_map = {}
         for k, v in (name_mapping or {}).items():
@@ -880,15 +881,14 @@ def _do_cvat_autopipeline(task_id, model_path, conf, mode, name_mapping):
                 mi = int(k)
             except (TypeError, ValueError):
                 continue
-            ti = name_to_idx.get(str(v).strip().lower())
-            if ti is not None:
-                idx_map[mi] = ti
-        # 2) run the model over every image
-        _set_ap(state="annotating", message="loading model…", total=len(images))
+            ci = name_to_idx.get(str(v).strip().lower())
+            if ci is not None:
+                idx_map[mi] = ci
+        _set_ap(state="annotating", message=f"{label}: loading model…", total=len(images), done=0)
         _load_model(model_path)
         added = 0
         for i, img in enumerate(images):
-            _set_ap(message=f"annotating {i+1}/{len(images)}…", done=i)
+            _set_ap(message=f"{label}: annotating {i+1}/{len(images)}…", done=i)
             lbl_path = os.path.join(lbl_dir, os.path.splitext(img)[0] + ".txt")
             has_existing = os.path.exists(lbl_path) and os.path.getsize(lbl_path) > 0
             if mode == "skip" and has_existing:
@@ -907,8 +907,7 @@ def _do_cvat_autopipeline(task_id, model_path, conf, mode, name_mapping):
             boxes = (_read_label_file(lbl_path) + new_boxes) if mode == "append" else new_boxes
             _write_label_file(lbl_path, boxes)
             added += len(new_boxes)
-        # 3) push the annotations back to the CVAT task
-        _set_ap(state="uploading", message=f"updating CVAT task {task_id}…", done=len(images))
+        _set_ap(state="uploading", message=f"{label}: updating CVAT…", done=len(images))
         fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_ap_")
         os.close(fd)
         fmap = frames if frames else {n: n for n in images}
@@ -917,11 +916,7 @@ def _do_cvat_autopipeline(task_id, model_path, conf, mode, name_mapping):
             task = client.tasks.retrieve(int(task_id))
             task.remove_annotations()
             _cvat_import_annotations(client, int(task_id), zip_path)
-        _set_ap(running=False, state="done", task_id=int(task_id), added=added,
-                task_url=f"{CVAT_URL}/tasks/{task_id}",
-                message=f"done ✓ added {added} boxes, updated task {task_id}")
-    except Exception as e:
-        _set_ap(running=False, state="error", error=str(e), message=f"failed: {e}")
+        return added
     finally:
         if zip_path and os.path.exists(zip_path):
             try:
@@ -930,13 +925,34 @@ def _do_cvat_autopipeline(task_id, model_path, conf, mode, name_mapping):
                 pass
 
 
+def _do_cvat_autopipeline(task_ids, model_path, conf, mode, name_mapping):
+    try:
+        n = len(task_ids)
+        total_added = 0
+        for ti, task_id in enumerate(task_ids):
+            _set_ap(cur_task=ti + 1, n_tasks=n, done_tasks=ti)
+            total_added += _autopipeline_one(
+                task_id, model_path, conf, mode, name_mapping, f"task {ti+1}/{n}")
+        last = task_ids[-1] if task_ids else None
+        _set_ap(running=False, state="done", done_tasks=n, added=total_added,
+                task_id=int(last) if last is not None else None,
+                task_url=f"{CVAT_URL}/tasks/{last}" if last is not None else None,
+                message=f"done ✓ added {total_added} boxes across {n} task(s)")
+    except Exception as e:
+        _set_ap(running=False, state="error", error=str(e), message=f"failed: {e}")
+
+
 @app.route("/api/cvat/autopipeline", methods=["POST"])
 def api_cvat_autopipeline():
     data = request.get_json(force=True)
-    task_id = data.get("task_id")
+    task_ids = data.get("task_ids")
+    if not isinstance(task_ids, list) or not task_ids:
+        single = data.get("task_id")
+        task_ids = [single] if single else []
+    task_ids = [t for t in task_ids if t]
     model_path = _safe_model_path(data.get("model", ""))
-    if not task_id:
-        return jsonify({"error": "no task selected"}), 400
+    if not task_ids:
+        return jsonify({"error": "no tasks selected"}), 400
     if not model_path:
         return jsonify({"error": "invalid model"}), 400
     try:
@@ -953,10 +969,11 @@ def api_cvat_autopipeline():
         if _ap_job["running"]:
             return jsonify({"error": "a pipeline run is already going"}), 409
         _ap_job.update(running=True, state="starting", message="starting…", done=0,
-                       total=0, task_id=None, task_url=None, added=0, error=None)
-    args = (task_id, model_path, conf, mode, mapping)
+                       total=0, cur_task=0, n_tasks=len(task_ids), task_id=None,
+                       task_url=None, added=0, done_tasks=0, error=None)
+    args = (task_ids, model_path, conf, mode, mapping)
     threading.Thread(target=_do_cvat_autopipeline, args=args, daemon=True).start()
-    return jsonify({"started": True})
+    return jsonify({"started": True, "count": len(task_ids)})
 
 
 @app.route("/api/cvat/autopipeline_status")
@@ -1360,6 +1377,22 @@ HTML = r"""<!DOCTYPE html>
   .maprow .arr{color:#778;}
   .maprow select{flex:1;min-width:0;padding:5px;background:#1b1b1b;color:#eee;
                  border:1px solid #555;border-radius:5px;font-size:12px;}
+  /* multi-select task list (auto-annotation pipeline) */
+  .aptasks{max-height:180px;overflow:auto;border:1px solid #555;border-radius:5px;
+           background:#1b1b1b;padding:4px;}
+  .aptasks .apt-empty{color:#889;padding:6px;font-size:12px;}
+  .aptasks .trow{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:4px;
+                 cursor:pointer;font-size:12px;}
+  .aptasks .trow:hover{background:#2a2a2a;}
+  .aptasks .trow input{accent-color:#49a05f;width:14px;height:14px;margin:0;flex:none;}
+  .aptasks .tid{font-family:monospace;color:#7fae8a;flex:none;}
+  .aptasks .tname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .aptaskcount{font-size:11px;color:#7fd1ff;text-transform:none;letter-spacing:0;}
+  .aprow{display:flex;gap:6px;align-items:center;margin:6px 0;}
+  .aprow .spacer{flex:1;}
+  .aprow button{flex:none;padding:5px 12px;background:#3a3a3a;color:#eee;border:1px solid #555;
+                border-radius:5px;cursor:pointer;font-size:12px;}
+  .aprow button:hover{background:#474747;}
   .cvtarget{font-size:13px;color:#cde;background:#1b1b1b;border:1px solid #555;
             border-radius:5px;padding:7px;word-break:break-word;}
   /* landing / home screen */
@@ -1610,10 +1643,13 @@ HTML = r"""<!DOCTYPE html>
           <select id="approj" onchange="loadApTasks()"><option value="">— select project —</option></select>
           <button onclick="loadApProjects(true)" title="refresh projects">&#8635;</button>
         </div>
-        <label>Task</label>
-        <div class="selrow">
-          <select id="aptask"><option value="">— select a project first —</option></select>
-          <button onclick="loadApTasks(true)" title="refresh tasks">&#8635;</button>
+        <label>Tasks <span id="aptaskcount" class="aptaskcount"></span></label>
+        <div id="aptasklist" class="aptasks"><div class="apt-empty">— select a project first —</div></div>
+        <div class="aprow">
+          <button onclick="apSelectAllTasks(true)">All</button>
+          <button onclick="apSelectAllTasks(false)">None</button>
+          <span class="spacer"></span>
+          <button onclick="loadApTasks(true)" title="refresh tasks">&#8635; refresh</button>
         </div>
         <label>Model</label>
         <select id="apmodel"><option value="">— loading models… —</option></select>
@@ -2459,7 +2495,8 @@ async function enterAuto(){
   document.getElementById('home').style.display='none';
   document.getElementById('apmodal').style.display='flex';
   apMsg(''); apShowConfig();
-  document.getElementById('aptask').innerHTML='<option value="">— select a project first —</option>';
+  document.getElementById('aptasklist').innerHTML='<div class="apt-empty">— select a project first —</div>';
+  apTaskCount();
   loadApProjects(); loadModelsInto('apmodel');
   try{
     const s=await fetch('/api/cvat/autopipeline_status?t='+Date.now()).then(r=>r.json());
@@ -2484,28 +2521,39 @@ async function loadApProjects(refresh){
 }
 async function loadApTasks(refresh){
   const pid=document.getElementById('approj').value;
-  const sel=document.getElementById('aptask');
-  if(!pid){ sel.innerHTML='<option value="">— select a project first —</option>'; return; }
-  const prev=sel.value;
-  sel.innerHTML='<option value="">loading tasks…</option>';
+  const host=document.getElementById('aptasklist');
+  if(!pid){ host.innerHTML='<div class="apt-empty">— select a project first —</div>'; apTaskCount(); return; }
+  host.innerHTML='<div class="apt-empty">loading tasks…</div>';
   try{
     const r=await fetch('/api/cvat/tasks?project_id='+encodeURIComponent(pid)
       +(refresh?'&refresh=1':'')+'&t='+Date.now()).then(r=>r.json());
-    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; apMsg('error: '+r.error); return; }
-    if(!r.tasks.length){ sel.innerHTML='<option value="">no tasks in this project</option>'; return; }
-    sel.innerHTML='<option value="">— select task —</option>'
-      +r.tasks.map(t=>'<option value="'+t.id+'">'+t.id+' — '+escapeHtml(t.name)
-        +(t.size!=null?(' ('+t.size+' imgs)'):'')+'</option>').join('');
-    if(prev) sel.value=prev;
+    if(r.error){ host.innerHTML='<div class="apt-empty">error: '+escapeHtml(r.error)+'</div>'; return; }
+    if(!r.tasks.length){ host.innerHTML='<div class="apt-empty">no tasks in this project</div>'; return; }
+    host.innerHTML=r.tasks.map(t=>'<label class="trow"><input type="checkbox" value="'+t.id
+      +'" onchange="apTaskCount()"><span class="tid">#'+t.id+'</span>'
+      +'<span class="tname">'+escapeHtml(t.name)+(t.size!=null?(' · '+t.size+' imgs'):'')
+      +'</span></label>').join('');
+    apTaskCount();
     if(refresh) apMsg(r.tasks.length+' tasks'+(r.cached?' (cached)':' refreshed'));
-  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; apMsg('task list failed'); }
+  }catch(e){ host.innerHTML='<div class="apt-empty">failed to load tasks</div>'; }
+}
+function apCheckedTasks(){
+  return [...document.querySelectorAll('#aptasklist input:checked')].map(c=>c.value);
+}
+function apTaskCount(){
+  const n=apCheckedTasks().length;
+  document.getElementById('aptaskcount').textContent = n?('('+n+' selected)'):'';
+}
+function apSelectAllTasks(on){
+  document.querySelectorAll('#aptasklist input[type=checkbox]').forEach(c=>c.checked=on);
+  apTaskCount();
 }
 async function apNext(){
   const pid=document.getElementById('approj').value;
-  const task=document.getElementById('aptask').value;
+  const tasks=apCheckedTasks();
   const model=document.getElementById('apmodel').value;
   if(!pid){ apMsg('select a project'); return; }
-  if(!task){ apMsg('select a task'); return; }
+  if(!tasks.length){ apMsg('select at least one task'); return; }
   if(!model){ apMsg('select a model'); return; }
   apMsg('loading model + project classes…');
   try{
@@ -2535,7 +2583,7 @@ function buildApMap(){
   }).join('');
 }
 async function runAutoPipeline(){
-  const task=document.getElementById('aptask').value;
+  const tasks=apCheckedTasks();
   const model=document.getElementById('apmodel').value;
   const conf=parseFloat(document.getElementById('apconf').value)||0.25;
   const mode=document.getElementById('apmode').value;
@@ -2543,12 +2591,13 @@ async function runAutoPipeline(){
   document.querySelectorAll('#apmaplist select').forEach(s=>{
     if(s.value!=='') mapping[s.getAttribute('data-mi')]=s.value;   // model idx -> class NAME
   });
+  if(!tasks.length){ apMsg('select at least one task'); return; }
   if(!Object.keys(mapping).length){ apMsg('map at least one class'); return; }
-  apMsg(''); apShowProgress(); apBar(0); apProgText('starting…');
+  apMsg(''); apShowProgress(); apBar(0); apProgText('starting '+tasks.length+' task(s)…');
   try{
     const r=await fetch('/api/cvat/autopipeline',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({task_id:task, model, conf, mode, mapping})}).then(r=>r.json());
+      body:JSON.stringify({task_ids:tasks, model, conf, mode, mapping})}).then(r=>r.json());
     if(r.error){ apProgText('error: '+r.error); return; }
     pollAutoPipeline();
   }catch(e){ apProgText('request failed'); }
@@ -2558,16 +2607,17 @@ function pollAutoPipeline(){
   apPoll=setInterval(async()=>{
     let s; try{ s=await fetch('/api/cvat/autopipeline_status?t='+Date.now()).then(r=>r.json()); }
     catch(e){ return; }
-    const pct = (s.state==='annotating'&&s.total) ? Math.round((s.done/s.total)*100)
-              : (s.state==='uploading'?92:(s.state==='importing'?8:0));
-    apBar(s.running?pct:100);
+    // overall progress across all tasks: completed tasks + fraction of current
+    const frac = (s.state==='annotating' && s.total) ? (s.done/s.total) : 0;
+    const pct = s.n_tasks ? Math.round(((s.cur_task-1)+frac)/s.n_tasks*100) : (s.running?5:0);
+    apBar(s.running?Math.max(2,pct):100);
     apProgText((s.message||s.state||'')+(s.state==='annotating'&&s.total?(' — '+s.done+'/'+s.total):''));
     if(!s.running){
       clearInterval(apPoll); apBar(100);
       document.getElementById('apcancel').textContent='Done';
       if(s.error) apProgText('failed: '+s.error);
-      else if(s.task_id) apProgText('done ✓ — '+s.added+' boxes, task '+s.task_id
-        +(s.task_url?' ('+s.task_url+')':''));
+      else apProgText('done ✓ — '+s.added+' boxes across '+(s.done_tasks||s.n_tasks)+' task(s)'
+        +(s.task_url?' · '+s.task_url:''));
     }
   }, 1000);
 }
