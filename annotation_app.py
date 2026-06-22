@@ -1324,6 +1324,8 @@ HTML = r"""<!DOCTYPE html>
   /* automatic-annotation modal + progress */
   .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;
             display:none;align-items:center;justify-content:center;}
+  /* the auto-annotation pipeline is standalone: opaque so the editor is hidden */
+  #apmodal{background:#161616;z-index:195;}
   .modal{background:#262626;border:1px solid #000;border-radius:10px;width:340px;
          max-width:90vw;box-shadow:0 12px 48px #000;}
   .modal-h{padding:12px 16px;font-size:14px;font-weight:600;border-bottom:1px solid #000;}
@@ -2464,7 +2466,10 @@ async function enterAuto(){
     if(s.running){ apShowProgress(); pollAutoPipeline(); }
   }catch(e){}
 }
-function closeApModal(){ document.getElementById('apmodal').style.display='none'; }
+function closeApModal(){
+  document.getElementById('apmodal').style.display='none';
+  goHome();                 // standalone flow: return to the landing screen
+}
 async function loadApProjects(refresh){
   const sel=document.getElementById('approj'); const prev=sel.value;
   sel.innerHTML='<option value="">loading…</option>';
