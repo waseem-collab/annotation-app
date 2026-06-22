@@ -767,40 +767,71 @@ def _cvat_export_task(session, task_id, zip_path):
     raise RuntimeError("export timed out")
 
 
-def _cvat_import_task(task_id, status=None):
-    """Download a task as YOLO+images into imports/<id>_<name>/, write the link
-    file, and return {out_dir, count, classes, frames, subset, name, project_id}.
-    `status` is an optional callable(message) for progress."""
+def _local_task_dirs(task_id):
+    """Existing imported folders for a task id (have an images/ subdir)."""
+    return [d for d in glob.glob(os.path.join(IMPORTS_DIR, f"{task_id}_*"))
+            if os.path.isdir(os.path.join(d, "images"))]
+
+
+def _classes_in(d):
+    try:
+        with open(os.path.join(d, "labels.txt")) as fh:
+            return [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return []
+
+
+def _cvat_import_task(task_id, status=None, force=False):
+    """Return a local copy of a task as {out_dir, count, classes, frames, subset,
+    name, project_id, cached}. Re-uses an existing folder if it's up to date with
+    CVAT (matching updated_date); otherwise downloads fresh. `force` always
+    downloads. `status` is an optional callable(message) for progress."""
     import tempfile
     import shutil
     def say(m):
         if status:
             status(m)
+    say("checking task…")
+    session = _cvat_session()
+    info = session.get(f"{CVAT_URL}/api/tasks/{task_id}").json()
+    tname = info.get("name") or f"task_{task_id}"
+    updated = info.get("updated_date")
+    # reuse an up-to-date local copy (no download)
+    if not force:
+        for d in _local_task_dirs(task_id):
+            try:
+                with open(os.path.join(d, ".cvat_task.json")) as fh:
+                    link = json.load(fh)
+            except (OSError, ValueError):
+                link = {}
+            if updated and link.get("updated_date") == updated:
+                imgs = os.listdir(os.path.join(d, "images"))
+                return {"out_dir": d, "count": len(imgs), "classes": _classes_in(d),
+                        "frames": link.get("frames") or {}, "subset": link.get("subset"),
+                        "name": tname, "project_id": info.get("project_id"), "cached": True}
+    # download fresh
     zip_path = None
     try:
-        say("connecting to CVAT…")
-        session = _cvat_session()
-        info = session.get(f"{CVAT_URL}/api/tasks/{task_id}").json()
-        tname = info.get("name") or f"task_{task_id}"
         fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_task_")
         os.close(fd)
-        say(f"exporting '{tname}' (images + annotations)…")
+        say(f"downloading '{tname}' (images + annotations)…")
         _cvat_export_task(session, task_id, zip_path)
+        for d in glob.glob(os.path.join(IMPORTS_DIR, f"{task_id}_*")):  # drop stale copies
+            shutil.rmtree(d, ignore_errors=True)
         out_dir = os.path.join(IMPORTS_DIR, f"{task_id}_{_safe_name(tname)}")
-        if os.path.isdir(out_dir):
-            shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir, exist_ok=True)
         say("extracting…")
         n, names, frames, subset = _extract_yolo_export(zip_path, out_dir)
         try:
             with open(os.path.join(out_dir, ".cvat_task.json"), "w") as fh:
                 json.dump({"task_id": int(task_id), "task_name": tname,
-                           "project_id": info.get("project_id"),
-                           "frames": frames, "subset": subset}, fh)
+                           "project_id": info.get("project_id"), "frames": frames,
+                           "subset": subset, "updated_date": updated}, fh)
         except OSError:
             pass
         return {"out_dir": out_dir, "count": n, "classes": names, "frames": frames,
-                "subset": subset, "name": tname, "project_id": info.get("project_id")}
+                "subset": subset, "name": tname, "project_id": info.get("project_id"),
+                "cached": False}
     finally:
         if zip_path and os.path.exists(zip_path):
             try:
@@ -811,10 +842,12 @@ def _cvat_import_task(task_id, status=None):
 
 def _do_cvat_import(task_id):
     try:
-        _set_imp(state="exporting", message="connecting to CVAT…")
+        _set_imp(state="exporting", message="checking task…")
         r = _cvat_import_task(task_id, status=lambda m: _set_imp(message=m))
-        _set_imp(running=False, state="done", path=r["out_dir"], count=r["count"],
-                 message=f"imported {r['count']} images, {len(r['classes'])} classes ✓")
+        msg = (f"already downloaded & up to date — {r['count']} images ✓"
+               if r.get("cached")
+               else f"downloaded {r['count']} images, {len(r['classes'])} classes ✓")
+        _set_imp(running=False, state="done", path=r["out_dir"], count=r["count"], message=msg)
     except Exception as e:
         _set_imp(running=False, state="error", error=str(e),
                  message=f"import failed: {e}")
