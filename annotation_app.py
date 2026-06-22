@@ -1548,7 +1548,7 @@ HTML = r"""<!DOCTYPE html>
         <button id="cvatlock" class="lockbtn" title="lock project" onclick="toggleCvatLock()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.5"/></svg></button>
       </div>
       <button class="wide" onclick="loadCvatProjects(true)">Refresh list</button>
-      <button class="wide" onclick="openCvatBrowse()">Import from CVAT…</button>
+      <button class="wide" id="cvatImportBtn" onclick="openCvatBrowse()">Import from CVAT…</button>
       <button class="wide ok" onclick="openCvModal()">Upload to CVAT…</button>
       <div id="cvatstatus"></div>
     </div>
@@ -1928,7 +1928,10 @@ function removeBox(i){
 // ---- landing screen + mode ----
 let appMode='local';   // 'local' = no CVAT options, 'cvat' = import/upload available
 function applyMode(){
-  document.getElementById('cvatsec').style.display = appMode==='cvat' ? 'block' : 'none';
+  // CVAT section (project + Upload) is available in both modes; only "Import
+  // from CVAT" is hidden in local mode.
+  document.getElementById('cvatsec').style.display='block';
+  document.getElementById('cvatImportBtn').style.display = appMode==='cvat' ? '' : 'none';
   updateModeBadge();
 }
 function updateModeBadge(){
