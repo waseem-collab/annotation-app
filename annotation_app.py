@@ -1045,23 +1045,26 @@ def _set_cc(**kw):
 def _do_classcount(project_id):
     from collections import defaultdict
     try:
-        _set_cc(state="loading", message="loading project labels & tasks…")
+        _set_cc(state="loading", message="loading labels, tasks & jobs…")
         s = _cvat_session()
         labels = _cvat_paginated(s, f"{CVAT_URL}/api/labels", {"project_id": project_id})
         id_to_name = {l["id"]: l["name"] for l in labels}
         tasks = _cvat_paginated(s, f"{CVAT_URL}/api/tasks", {"project_id": project_id})
-        n = len(tasks)
-        # every project label starts at zero so unused classes still show
+        task_list = [{"id": t["id"], "name": t.get("name") or f"task_{t['id']}"} for t in tasks]
+        # Count from JOBS, not the task-level /annotations endpoint (which returns
+        # nothing for many tasks on this server). Skip ground-truth (validation)
+        # jobs so only real annotation work is counted.
+        jobs = _cvat_paginated(s, f"{CVAT_URL}/api/jobs", {"project_id": project_id})
+        ann_jobs = [j for j in jobs if j.get("type") != "ground_truth"]
+        m = len(ann_jobs)
         counts = {name: {"total": 0, "tasks": {}} for name in id_to_name.values()}
-        task_totals, task_list = {}, []
-        for i, t in enumerate(tasks):
-            tid = t["id"]
-            tname = t.get("name") or f"task_{tid}"
-            task_list.append({"id": tid, "name": tname})
-            _set_cc(state="counting", done=i, total=n,
-                    message=f"counting {i+1}/{n}: {tname}…")
+        task_totals = defaultdict(int)
+        for k, j in enumerate(ann_jobs):
+            tid = j.get("task_id")
+            _set_cc(state="counting", done=k, total=m,
+                    message=f"counting job {k+1}/{m} (task {tid})…")
             try:
-                ann = s.get(f"{CVAT_URL}/api/tasks/{tid}/annotations", timeout=180).json()
+                ann = s.get(f"{CVAT_URL}/api/jobs/{j['id']}/annotations", timeout=180).json()
             except Exception:
                 continue
             per = defaultdict(int)
@@ -1071,21 +1074,19 @@ def _do_classcount(project_id):
                 per[tg["label_id"]] += 1
             for tr in ann.get("tracks", []):       # each track keyframe = one instance
                 per[tr["label_id"]] += len(tr.get("shapes", []))
-            tt = 0
             for lid, c in per.items():
                 name = id_to_name.get(lid, f"label_{lid}")
                 counts.setdefault(name, {"total": 0, "tasks": {}})
                 counts[name]["total"] += c
-                counts[name]["tasks"][str(tid)] = c
-                tt += c
-            task_totals[str(tid)] = tt
+                counts[name]["tasks"][str(tid)] = counts[name]["tasks"].get(str(tid), 0) + c
+                task_totals[str(tid)] += c
         classes = sorted(counts.keys(), key=lambda x: x.lower())
         grand = sum(c["total"] for c in counts.values())
         result = {"classes": classes, "tasks": task_list, "counts": counts,
-                  "task_totals": task_totals, "grand_total": grand,
+                  "task_totals": dict(task_totals), "grand_total": grand,
                   "project_id": int(project_id)}
-        _set_cc(running=False, state="done", done=n, result=result,
-                message=f"done ✓ {grand} annotations across {n} tasks, {len(classes)} classes")
+        _set_cc(running=False, state="done", done=m, result=result,
+                message=f"done ✓ {grand} annotations across {len(task_list)} tasks, {len(classes)} classes")
     except Exception as e:
         _set_cc(running=False, state="error", error=str(e), message=f"failed: {e}")
 
