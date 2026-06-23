@@ -1016,6 +1016,104 @@ def api_cvat_autopipeline_status():
 
 
 # --------------------------------------------------------------------------- #
+# Class count: per-class annotation counts in a project (project- and task-wise)
+# --------------------------------------------------------------------------- #
+def _cvat_paginated(session, url, params=None):
+    params = dict(params or {})
+    params.setdefault("page_size", 100)
+    out, page = [], 1
+    while True:
+        params["page"] = page
+        d = session.get(url, params=params, timeout=60).json()
+        out += d.get("results", [])
+        if not d.get("next"):
+            break
+        page += 1
+    return out
+
+
+_cc_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
+           "error": None, "result": None}
+_cc_lock = threading.Lock()
+
+
+def _set_cc(**kw):
+    with _cc_lock:
+        _cc_job.update(kw)
+
+
+def _do_classcount(project_id):
+    from collections import defaultdict
+    try:
+        _set_cc(state="loading", message="loading project labels & tasks…")
+        s = _cvat_session()
+        labels = _cvat_paginated(s, f"{CVAT_URL}/api/labels", {"project_id": project_id})
+        id_to_name = {l["id"]: l["name"] for l in labels}
+        tasks = _cvat_paginated(s, f"{CVAT_URL}/api/tasks", {"project_id": project_id})
+        n = len(tasks)
+        # every project label starts at zero so unused classes still show
+        counts = {name: {"total": 0, "tasks": {}} for name in id_to_name.values()}
+        task_totals, task_list = {}, []
+        for i, t in enumerate(tasks):
+            tid = t["id"]
+            tname = t.get("name") or f"task_{tid}"
+            task_list.append({"id": tid, "name": tname})
+            _set_cc(state="counting", done=i, total=n,
+                    message=f"counting {i+1}/{n}: {tname}…")
+            try:
+                ann = s.get(f"{CVAT_URL}/api/tasks/{tid}/annotations", timeout=180).json()
+            except Exception:
+                continue
+            per = defaultdict(int)
+            for sh in ann.get("shapes", []):
+                per[sh["label_id"]] += 1
+            for tg in ann.get("tags", []):
+                per[tg["label_id"]] += 1
+            for tr in ann.get("tracks", []):       # each track keyframe = one instance
+                per[tr["label_id"]] += len(tr.get("shapes", []))
+            tt = 0
+            for lid, c in per.items():
+                name = id_to_name.get(lid, f"label_{lid}")
+                counts.setdefault(name, {"total": 0, "tasks": {}})
+                counts[name]["total"] += c
+                counts[name]["tasks"][str(tid)] = c
+                tt += c
+            task_totals[str(tid)] = tt
+        classes = sorted(counts.keys(), key=lambda x: x.lower())
+        grand = sum(c["total"] for c in counts.values())
+        result = {"classes": classes, "tasks": task_list, "counts": counts,
+                  "task_totals": task_totals, "grand_total": grand,
+                  "project_id": int(project_id)}
+        _set_cc(running=False, state="done", done=n, result=result,
+                message=f"done ✓ {grand} annotations across {n} tasks, {len(classes)} classes")
+    except Exception as e:
+        _set_cc(running=False, state="error", error=str(e), message=f"failed: {e}")
+
+
+@app.route("/api/cvat/classcount", methods=["POST"])
+def api_cvat_classcount():
+    data = request.get_json(force=True)
+    project_id = data.get("project_id")
+    if not project_id:
+        return jsonify({"error": "no project selected"}), 400
+    if not (CVAT_URL and CVAT_USER and CVAT_PASS):
+        return jsonify({"error": "CVAT credentials missing in .env"}), 400
+    with _cc_lock:
+        if _cc_job["running"]:
+            return jsonify({"error": "a count is already running"}), 409
+        _cc_job.update(running=True, state="starting", message="starting…",
+                       done=0, total=0, error=None, result=None)
+    threading.Thread(target=_do_classcount, args=(project_id,), daemon=True).start()
+    return jsonify({"started": True})
+
+
+@app.route("/api/cvat/classcount_status")
+def api_cvat_classcount_status():
+    with _cc_lock:
+        return jsonify(dict(_cc_job))
+
+
+# --------------------------------------------------------------------------- #
 # Automatic annotation (YOLO models from MODELS_DIR)
 # --------------------------------------------------------------------------- #
 _models_cache = {}
@@ -1477,7 +1575,7 @@ HTML = r"""<!DOCTYPE html>
   #home{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
         background:radial-gradient(circle at 18% 0%,rgba(110,168,254,.10),transparent 42%),
                    radial-gradient(circle at 85% 100%,rgba(52,211,153,.08),transparent 45%),var(--bg);}
-  .home-inner{text-align:center;max-width:980px;padding:24px;}
+  .home-inner{text-align:center;max-width:610px;padding:24px;}
   .home-logo{width:60px;height:60px;border-radius:16px;margin:0 auto 16px;display:block;
              filter:drop-shadow(0 10px 28px rgba(110,168,254,.25));}
   .home-title{font-size:32px;margin:0 0 6px;color:var(--text);font-weight:700;letter-spacing:-.5px;}
@@ -1491,6 +1589,27 @@ HTML = r"""<!DOCTYPE html>
            margin-bottom:16px;background:var(--accent-soft);color:var(--accent);}
   .home-card.cvat .hc-icon{background:var(--ok-soft);color:var(--ok);}
   .home-card.auto .hc-icon{background:rgba(251,191,36,.14);color:var(--warn);}
+  .home-card.count .hc-icon{background:rgba(167,139,250,.15);color:#a78bfa;}
+  /* class-count table */
+  #ccbody{flex:1;overflow:auto;padding:18px 20px;}
+  .cc-summary{font-size:13px;color:var(--text-muted);margin-bottom:14px;}
+  .cc-summary b{color:var(--text);}
+  .cc-table{border-collapse:separate;border-spacing:0;font-size:12.5px;width:max-content;min-width:100%;}
+  .cc-table th,.cc-table td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowrap;}
+  .cc-table thead th{position:sticky;top:0;background:var(--surface-3);color:var(--text-muted);
+                     text-transform:uppercase;font-size:10.5px;letter-spacing:.5px;font-weight:600;
+                     text-align:right;z-index:2;}
+  .cc-table thead th .tkid{display:block;font-size:9.5px;color:var(--text-dim);font-weight:500;text-transform:none;}
+  .cc-table th.cc-class,.cc-table td.cc-class{position:sticky;left:0;background:var(--surface);
+                     text-align:left;z-index:1;font-weight:500;color:var(--text);border-right:1px solid var(--border);}
+  .cc-table thead th.cc-class{z-index:3;background:var(--surface-3);}
+  .cc-table td{text-align:right;color:var(--text-muted);font-family:ui-monospace,Menlo,monospace;}
+  .cc-table td.cc-total{color:var(--accent);font-weight:600;}
+  .cc-table tbody tr:hover td{background:var(--surface-2);}
+  .cc-table tbody tr:hover td.cc-class{background:var(--surface-2);}
+  .cc-table .cc-totalrow td{border-top:2px solid var(--border-2);color:var(--text);font-weight:700;background:var(--surface-3);}
+  .cc-table .cc-totalrow td.cc-class{background:var(--surface-3);}
+  .cc-table td.zero{color:var(--text-dim);}
   .home-card:hover .hc-icon{transform:scale(1.05);transition:transform .14s;}
   .hc-title{font-size:17px;font-weight:600;color:var(--text);margin-bottom:8px;letter-spacing:-.2px;}
   .hc-desc{font-size:13px;color:var(--text-muted);line-height:1.55;}
@@ -1545,6 +1664,11 @@ HTML = r"""<!DOCTYPE html>
         <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.1 4.1.6-3 2.9.7 4.4L12 17l-3.7 2 .7-4.4-3-2.9 4.1-.6z"/><path d="M5 21h14"/></svg></div>
         <div class="hc-title">Automatic annotations</div>
         <div class="hc-desc">Pick a CVAT project + task, run a model on it, and push the annotations back to CVAT.</div>
+      </div>
+      <div class="home-card count" onclick="enterCount()">
+        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="11" width="3" height="6" rx="1"/><rect x="12.5" y="7" width="3" height="10" rx="1"/><rect x="18" y="13" width="3" height="4" rx="1"/></svg></div>
+        <div class="hc-title">Class count</div>
+        <div class="hc-desc">Count annotations per class in a CVAT project — project-wide and broken down by task.</div>
       </div>
     </div>
   </div>
@@ -1716,6 +1840,25 @@ HTML = r"""<!DOCTYPE html>
       <div id="browseProgText"></div>
       <button class="bp-close" onclick="browseCancelProg()">Close</button>
     </div>
+  </div>
+</div>
+
+<div id="ccview" class="browse">
+  <div class="browse-bar">
+    <button onclick="goHome()" title="home"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/></svg></button>
+    <span class="browse-title">Class count</span>
+    <span class="spacer"></span>
+    <select id="ccproj" style="width:auto;min-width:220px;max-width:340px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:13px;"><option value="">— select project —</option></select>
+    <button onclick="ccLoadProjects(true)" title="refresh projects"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
+    <button class="ok" id="ccrun" onclick="ccRun()" style="background:var(--accent);color:#0a0a0a;border-color:var(--accent);font-weight:600;">Count</button>
+  </div>
+  <div id="ccbody">
+    <div id="ccempty" class="browse-empty">Select a CVAT project and click <b>Count</b>.</div>
+    <div id="ccprog" class="bp-card" style="display:none;margin:40px auto;">
+      <div class="bar indet"><div></div></div>
+      <div id="ccprogtext" style="font-size:13px;color:var(--text);"></div>
+    </div>
+    <div id="ccresult"></div>
   </div>
 </div>
 
@@ -2712,6 +2855,94 @@ function pollAutoPipeline(){
         +(s.task_url?' · '+s.task_url:''));
     }
   }, 1000);
+}
+
+// ---- Class count (project- and task-wise) ----
+let ccPoll=null;
+async function enterCount(){
+  appMode='cvat'; applyMode();
+  document.getElementById('home').style.display='none';
+  document.getElementById('ccview').style.display='flex';
+  document.getElementById('ccresult').innerHTML='';
+  document.getElementById('ccprog').style.display='none';
+  document.getElementById('ccempty').style.display='block';
+  ccLoadProjects();
+  try{
+    const s=await fetch('/api/cvat/classcount_status?t='+Date.now()).then(r=>r.json());
+    if(s.running){ ccShowProgress(); pollClassCount(); }
+    else if(s.result){ renderCcTable(s.result); }
+  }catch(e){}
+}
+async function ccLoadProjects(refresh){
+  const sel=document.getElementById('ccproj'); const prev=sel.value;
+  sel.innerHTML='<option value="">loading…</option>';
+  try{
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; return; }
+    sel.innerHTML='<option value="">— select project —</option>'
+      +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
+    if(prev) sel.value=prev;
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; }
+}
+function ccShowProgress(){
+  document.getElementById('ccempty').style.display='none';
+  document.getElementById('ccresult').innerHTML='';
+  document.getElementById('ccprog').style.display='block';
+}
+async function ccRun(){
+  const pid=document.getElementById('ccproj').value;
+  if(!pid){ document.getElementById('ccempty').style.display='block';
+    document.getElementById('ccempty').textContent='Select a project first.'; return; }
+  ccShowProgress();
+  document.getElementById('ccprogtext').textContent='starting…';
+  try{
+    const r=await fetch('/api/cvat/classcount',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({project_id:pid})}).then(r=>r.json());
+    if(r.error){ document.getElementById('ccprogtext').textContent='error: '+r.error; return; }
+    pollClassCount();
+  }catch(e){ document.getElementById('ccprogtext').textContent='request failed'; }
+}
+function pollClassCount(){
+  clearInterval(ccPoll);
+  ccPoll=setInterval(async()=>{
+    let s; try{ s=await fetch('/api/cvat/classcount_status?t='+Date.now()).then(r=>r.json()); }
+    catch(e){ return; }
+    document.getElementById('ccprogtext').textContent=(s.message||s.state||'')
+      +(s.state==='counting'&&s.total?(' — '+s.done+'/'+s.total):'');
+    if(!s.running){
+      clearInterval(ccPoll);
+      document.getElementById('ccprog').style.display='none';
+      if(s.error){ document.getElementById('ccempty').style.display='block';
+        document.getElementById('ccempty').textContent='Failed: '+s.error; return; }
+      if(s.result) renderCcTable(s.result);
+    }
+  }, 1000);
+}
+function renderCcTable(res){
+  const tasks=res.tasks||[], classes=res.classes||[], counts=res.counts||{};
+  document.getElementById('ccempty').style.display='none';
+  let h='<div class="cc-summary">Project <b>#'+res.project_id+'</b> · <b>'+classes.length
+    +'</b> classes · <b>'+tasks.length+'</b> tasks · <b>'+res.grand_total
+    +'</b> total annotations</div>';
+  h+='<table class="cc-table"><thead><tr><th class="cc-class">Class</th>'
+    +'<th>Total</th>'
+    +tasks.map(t=>'<th>'+escapeHtml(t.name)+'<span class="tkid">#'+t.id+'</span></th>').join('')
+    +'</tr></thead><tbody>';
+  classes.forEach(cn=>{
+    const c=counts[cn]||{total:0,tasks:{}};
+    h+='<tr><td class="cc-class">'+escapeHtml(cn)+'</td>'
+      +'<td class="cc-total'+(c.total?'':' zero')+'">'+(c.total||0)+'</td>'
+      +tasks.map(t=>{ const v=(c.tasks||{})[String(t.id)]||0;
+        return '<td class="'+(v?'':'zero')+'">'+v+'</td>'; }).join('')
+      +'</tr>';
+  });
+  // totals row
+  h+='<tr class="cc-totalrow"><td class="cc-class">TOTAL</td><td>'+res.grand_total+'</td>'
+    +tasks.map(t=>'<td>'+((res.task_totals||{})[String(t.id)]||0)+'</td>').join('')
+    +'</tr>';
+  h+='</tbody></table>';
+  document.getElementById('ccresult').innerHTML=h;
 }
 
 async function saveIfDirty(){
