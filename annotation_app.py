@@ -1018,13 +1018,38 @@ def api_cvat_autopipeline_status():
 # --------------------------------------------------------------------------- #
 # Class count: per-class annotation counts in a project (project- and task-wise)
 # --------------------------------------------------------------------------- #
+def _cvat_get(session, url, params=None, retries=10, on_throttle=None):
+    """GET that respects CVAT's rate limit (HTTP 429): on throttling it waits the
+    server-suggested Retry-After and retries. app.cvat.ai throttles ~20 req/min,
+    so without this a project's per-job annotation fetches get dropped."""
+    import time
+    resp = None
+    for attempt in range(retries):
+        resp = session.get(url, params=params, timeout=180)
+        if resp.status_code != 429:
+            return resp
+        wait = resp.headers.get("Retry-After")
+        try:
+            wait = float(wait)
+        except (TypeError, ValueError):
+            wait = min(2 ** attempt, 30)
+        wait = min(max(wait, 1), 60) + 0.5
+        if on_throttle:
+            on_throttle(wait)
+        time.sleep(wait)
+    return resp
+
+
 def _cvat_paginated(session, url, params=None):
     params = dict(params or {})
     params.setdefault("page_size", 100)
     out, page = [], 1
     while True:
         params["page"] = page
-        d = session.get(url, params=params, timeout=60).json()
+        resp = _cvat_get(session, url, params=params)
+        if resp.status_code != 200:
+            break
+        d = resp.json()
         out += d.get("results", [])
         if not d.get("next"):
             break
@@ -1064,7 +1089,13 @@ def _do_classcount(project_id):
             _set_cc(state="counting", done=k, total=m,
                     message=f"counting job {k+1}/{m} (task {tid})…")
             try:
-                ann = s.get(f"{CVAT_URL}/api/jobs/{j['id']}/annotations", timeout=180).json()
+                resp = _cvat_get(
+                    s, f"{CVAT_URL}/api/jobs/{j['id']}/annotations",
+                    on_throttle=lambda w, k=k: _set_cc(
+                        message=f"CVAT rate limit — waiting {int(w)}s… (job {k+1}/{m})"))
+                if resp.status_code != 200:
+                    continue
+                ann = resp.json()
             except Exception:
                 continue
             per = defaultdict(int)
