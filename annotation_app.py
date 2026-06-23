@@ -1490,9 +1490,10 @@ HTML = r"""<!DOCTYPE html>
   .dropdown{position:relative;display:block;width:100%;}
   .selrow .dropdown,.lp-row .dropdown,.maprow .dropdown,.row .dropdown{flex:1 1 auto;min-width:0;}
   .browse-bar .dropdown{width:260px;flex:none;}
-  .row .dropdown-trigger{padding:5px 8px;font-size:12px;background:var(--bg);}
-  .dropdown-trigger{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;
-    background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 11px;
+  .row .dropdown-trigger{padding:5px 8px !important;font-size:12px;background:var(--bg);}
+  .dropdown-trigger{display:flex !important;align-items:center;justify-content:space-between !important;
+    gap:10px;width:100% !important;box-sizing:border-box;
+    background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 11px !important;
     border-radius:var(--r);font-size:13px;cursor:pointer;text-align:left;
     transition:border-color .15s,box-shadow .15s;}
   .dropdown-trigger:hover,.dropdown-trigger.open{border-color:var(--accent);box-shadow:var(--ring);}
@@ -1580,10 +1581,11 @@ HTML = r"""<!DOCTYPE html>
   .modal select:focus,.modal input:focus{border-color:var(--accent);box-shadow:var(--ring);}
   .modal .selrow{display:flex;gap:7px;align-items:center;}
   .modal .selrow select{flex:1;min-width:0;}
-  .modal .selrow button{flex:none;width:40px;padding:9px 0;background:transparent;color:var(--text-muted);
+  /* direct child only, so it doesn't hit the custom-dropdown trigger button */
+  .modal .selrow > button{flex:none;width:40px;padding:9px 0;background:transparent;color:var(--text-muted);
          border:1px solid var(--border);border-radius:var(--r);cursor:pointer;display:flex;
          align-items:center;justify-content:center;transition:background .15s,color .15s;}
-  .modal .selrow button:hover{background:var(--surface-2);color:var(--text);}
+  .modal .selrow > button:hover{background:var(--surface-2);color:var(--text);}
   .modal-f{padding:14px 18px;border-top:1px solid var(--border);display:flex;
            justify-content:flex-end;gap:9px;}
   .modal-f button{padding:9px 18px;border-radius:var(--r);border:1px solid var(--border);
