@@ -606,6 +606,43 @@ def _safe_name(s):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_") or "task"
 
 
+def _norm_dt(v):
+    """Normalise a CVAT updated_date (datetime or string) to a comparable string."""
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        v = v.isoformat()
+    return str(v).replace("Z", "+00:00")
+
+
+def _local_task_status(task_id, updated=None):
+    """Whether a task already has a local imported copy, and if it's current.
+    Cheap (local filesystem only) — no CVAT calls."""
+    dirs = _local_task_dirs(task_id)
+    if not dirs:
+        return {"imported": False, "up_to_date": False}
+    # Without a reference updated_date we can't judge freshness -> assume current
+    # (don't show a false "update available"); refreshing the list makes it exact.
+    if not updated:
+        return {"imported": True, "up_to_date": True}
+    up_to_date = False
+    for d in dirs:
+        try:
+            with open(os.path.join(d, ".cvat_task.json"), encoding="utf-8") as fh:
+                link = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if _norm_dt(link.get("updated_date")) == _norm_dt(updated):
+            up_to_date = True
+            break
+    return {"imported": True, "up_to_date": up_to_date}
+
+
+def _annotate_imports(tasks):
+    """Return task dicts tagged with current local-import status (fresh each call)."""
+    return [{**t, **_local_task_status(t.get("id"), t.get("updated_date"))} for t in tasks]
+
+
 def _cvat_list_tasks(project_id):
     with _cvat_client() as client:
         out, page = [], 1
@@ -613,7 +650,8 @@ def _cvat_list_tasks(project_id):
             data, _ = client.api_client.tasks_api.list(
                 project_id=int(project_id), page=page, page_size=100)
             for t in data.results:
-                out.append({"id": t.id, "name": t.name, "size": getattr(t, "size", None)})
+                out.append({"id": t.id, "name": t.name, "size": getattr(t, "size", None),
+                            "updated_date": _norm_dt(getattr(t, "updated_date", None))})
             if not getattr(data, "next", None):
                 break
             page += 1
@@ -631,17 +669,17 @@ def api_cvat_tasks():
     with _cvat_cache_lock:
         cached = _cvat_cache["tasks"].get(key)
     if not refresh and cached is not None:
-        return jsonify({"tasks": cached, "cached": True})
+        return jsonify({"tasks": _annotate_imports(cached), "cached": True})
     try:
         tasks = _cvat_list_tasks(pid)
         tasks.sort(key=lambda t: t["id"], reverse=True)   # newest first
         with _cvat_cache_lock:
             _cvat_cache["tasks"][key] = tasks
             _save_cvat_cache()
-        return jsonify({"tasks": tasks})
+        return jsonify({"tasks": _annotate_imports(tasks)})
     except Exception as e:
         if cached is not None:
-            return jsonify({"tasks": cached, "cached": True, "warn": str(e)})
+            return jsonify({"tasks": _annotate_imports(cached), "cached": True, "warn": str(e)})
         return jsonify({"error": str(e)}), 500
 
 
@@ -1692,9 +1730,15 @@ HTML = r"""<!DOCTYPE html>
   .browse-grid{flex:1;overflow:auto;display:grid;align-content:start;gap:14px;padding:20px;
                grid-template-columns:repeat(auto-fill,minmax(240px,1fr));}
   .browse-empty{color:var(--text-dim);padding:20px;font-size:14px;}
-  .bcard{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px;
+  .bcard{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px;
          cursor:pointer;box-shadow:var(--sh-sm);display:flex;flex-direction:column;gap:6px;
          transition:transform .12s,border-color .12s,box-shadow .12s;}
+  .bc-badge{position:absolute;top:12px;right:12px;display:inline-flex;align-items:center;gap:4px;
+    font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;
+    padding:3px 8px 3px 6px;border-radius:999px;line-height:1;}
+  .bc-badge svg{flex:none;}
+  .bc-badge.ok{background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.35);}
+  .bc-badge.warn{background:rgba(251,191,36,.15);color:var(--warn);border:1px solid rgba(251,191,36,.38);}
   .bcard:hover{transform:translateY(-3px);border-color:var(--accent);box-shadow:var(--sh-md);}
   .bcard .bc-id{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--ok);}
   .bcard .bc-name{font-size:15px;font-weight:600;color:var(--text);word-break:break-word;letter-spacing:-.2px;flex:1;}
@@ -2849,10 +2893,18 @@ function pollCvatUpload(){
 // ---- CVAT browser: project cards -> task cards -> import ----
 let impPoll=null, bProjects=[], bTasks=[], browseState='projects',
     browseProjectId=null, browseProjectName='';
-function bCard(id,name,sub,onclick){
-  return '<div class="bcard" onclick="'+onclick+'"><div class="bc-id">#'+id+'</div>'
+function bCard(id,name,sub,onclick,badge){
+  return '<div class="bcard" onclick="'+onclick+'">'+(badge||'')+'<div class="bc-id">#'+id+'</div>'
     +'<div class="bc-name">'+escapeHtml(name)+'</div>'
     +(sub?'<div class="bc-sub">'+escapeHtml(sub)+'</div>':'')+'</div>';
+}
+const _ICO_CHECK='<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+const _ICO_SYNC='<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/></svg>';
+function taskBadge(t){
+  if(!t.imported) return '';
+  return t.up_to_date===false
+    ? '<span class="bc-badge warn">'+_ICO_SYNC+'update available</span>'
+    : '<span class="bc-badge ok">'+_ICO_CHECK+'imported</span>';
 }
 function openCvatBrowse(){
   document.getElementById('cvatbrowse').style.display='flex';
@@ -2887,7 +2939,10 @@ async function openProject(pid, pname, refresh){
     if(r.error){ grid.innerHTML='<div class="browse-empty">error: '+escapeHtml(r.error)+'</div>'; return; }
     bTasks=r.tasks||[];
     grid.innerHTML = bTasks.length
-      ? bTasks.map((t,i)=>bCard(t.id,t.name,(t.size!=null?t.size+' images · ':'')+'import →','openTaskIdx('+i+')')).join('')
+      ? bTasks.map((t,i)=>{
+          const act=t.imported?(t.up_to_date===false?'update →':'open →'):'import →';
+          return bCard(t.id,t.name,(t.size!=null?t.size+' images · ':'')+act,'openTaskIdx('+i+')',taskBadge(t));
+        }).join('')
       : '<div class="browse-empty">no tasks in this project</div>';
   }catch(e){ grid.innerHTML='<div class="browse-empty">failed to load tasks</div>'; }
 }
