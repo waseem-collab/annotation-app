@@ -1760,6 +1760,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="lp-sec">
       <h4>Active class &mdash; hold <kbd>C</kbd> for wheel</h4>
       <select id="classsel" onchange="setActiveClass(parseInt(this.value,10))"></select>
+      <button class="wide" style="margin-top:7px;" onclick="openClsModal()">Import classes from CVAT</button>
     </div>
     <div class="lp-sec">
       <h4 class="collapse-h" onclick="toggleVisSec()"><span id="viscaret"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></span> Visible labels</h4>
@@ -1852,6 +1853,25 @@ HTML = r"""<!DOCTYPE html>
       <button id="aaback" onclick="aaShowConfig()" style="display:none;">Back</button>
       <button id="aanext" class="ok" onclick="aaNext()">Next</button>
       <button id="aarun" class="ok" onclick="runAutoAnnotate()" style="display:none;">Annotate</button>
+    </div>
+  </div>
+</div>
+
+<div id="clsmodal" class="modal-bg">
+  <div class="modal">
+    <div class="modal-h">Import classes from CVAT</div>
+    <div class="modal-body">
+      <label>Project</label>
+      <div class="selrow">
+        <select id="clsproj"><option value="">— select project —</option></select>
+        <button onclick="loadClsProjects(true)" title="refresh projects"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
+      </div>
+      <div class="maphint">The project's labels become the annotation classes for this folder.</div>
+      <div id="clsmsg" class="aamsg"></div>
+    </div>
+    <div class="modal-f">
+      <button onclick="closeClsModal()">Cancel</button>
+      <button class="ok" id="clsrun" onclick="runImportClasses()">Import classes</button>
     </div>
   </div>
 </div>
@@ -2269,17 +2289,22 @@ function updateModeBadge(){
     el.textContent='CVAT'; el.className='mode cvat';
   } else { el.textContent='Local'; el.className='mode local'; }
 }
+// only one full-screen surface at a time
+function hideAllScreens(){
+  ['home','cvatbrowse','ccview','apmodal'].forEach(id=>{
+    const e=document.getElementById(id); if(e) e.style.display='none'; });
+}
 function enterLocal(){
   appMode='local'; applyMode();
-  document.getElementById('home').style.display='none';
+  hideAllScreens();
   if(img.complete && img.naturalWidth){ fit(); draw(); }
 }
 function enterImport(){
   appMode='cvat'; applyMode();
-  document.getElementById('home').style.display='none';
+  hideAllScreens();
   openCvatBrowse();
 }
-function goHome(){ document.getElementById('home').style.display='flex'; }
+function goHome(){ hideAllScreens(); document.getElementById('home').style.display='flex'; }
 
 // delete the current image (and its label) from disk, then advance
 async function deleteImage(){
@@ -2637,6 +2662,39 @@ async function fetchCvatClasses(){
 function onCvatProjPick(){
   if(document.getElementById('cvatproj').value) fetchCvatClasses();
 }
+// ---- import classes from a CVAT project (available in local mode) ----
+function openClsModal(){
+  document.getElementById('clsmodal').style.display='flex';
+  document.getElementById('clsmsg').textContent='';
+  loadClsProjects();
+}
+function closeClsModal(){ document.getElementById('clsmodal').style.display='none'; }
+async function loadClsProjects(refresh){
+  const sel=document.getElementById('clsproj'); const prev=sel.value;
+  sel.innerHTML='<option value="">loading…</option>';
+  try{
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; document.getElementById('clsmsg').textContent='error: '+r.error; return; }
+    sel.innerHTML='<option value="">— select project —</option>'
+      +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
+    if(prev) sel.value=prev;
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; }
+}
+async function runImportClasses(){
+  const pid=document.getElementById('clsproj').value;
+  const msg=document.getElementById('clsmsg');
+  if(!pid){ msg.textContent='select a project'; return; }
+  msg.textContent='fetching classes for project '+pid+'…';
+  try{
+    const r=await fetch('/api/cvat/projectlabels?project_id='+encodeURIComponent(pid)
+      +'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ msg.textContent='error: '+r.error; return; }
+    if(!r.classes.length){ msg.textContent='project '+pid+' has no labels'; return; }
+    classes=r.classes; activeClass=0; buildClassUI(); draw();
+    setStatus('imported '+classes.length+' classes from CVAT project '+pid+' ✓');
+    closeClsModal();
+  }catch(e){ msg.textContent='request failed'; }
+}
 // ---- CVAT upload modal + progress ----
 let cvatPoll=null;
 function cvMsg(t){ const e=document.getElementById('cvmsg'); if(e) e.textContent=t||''; }
@@ -2870,7 +2928,7 @@ function apShowProgress(){
 }
 async function enterAuto(){
   appMode='cvat'; applyMode();
-  document.getElementById('home').style.display='none';
+  hideAllScreens();
   document.getElementById('apmodal').style.display='flex';
   apMsg(''); apShowConfig();
   document.getElementById('aptasklist').innerHTML='<div class="apt-empty">— select a project first —</div>';
@@ -3005,7 +3063,7 @@ function pollAutoPipeline(){
 let ccPoll=null;
 async function enterCount(){
   appMode='cvat'; applyMode();
-  document.getElementById('home').style.display='none';
+  hideAllScreens();
   document.getElementById('ccview').style.display='flex';
   document.getElementById('ccresult').innerHTML='';
   document.getElementById('ccprog').style.display='none';
@@ -3297,7 +3355,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   updateNav();
   applyMode();                 // default to Local (CVAT section hidden until chosen)
   enhanceSelects(['classsel','cvatproj','aamodel','aatarget','aamode','apmodel',
-                  'approj','apmode','cvUploadProj','ccproj']);   // styled dropdowns
+                  'approj','apmode','cvUploadProj','ccproj','clsproj']);  // styled dropdowns
   loadCvatProjects();          // populate the CVAT project dropdown in the background
   if(!count){ setStatus('no images in '+(m.path||'')+' — set a folder above'); return; }
   load(0);
