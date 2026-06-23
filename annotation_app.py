@@ -1455,6 +1455,29 @@ HTML = r"""<!DOCTYPE html>
      color:var(--text);border:1px solid var(--border);border-radius:var(--r);font-size:13px;outline:none;
      transition:border-color .15s,box-shadow .15s;}
   .lp-sec select:focus{border-color:var(--accent);box-shadow:var(--ring);}
+  /* custom dropdowns — styled menu with hover-coloured options */
+  .dropdown{position:relative;display:block;width:100%;}
+  .selrow .dropdown,.lp-row .dropdown,.maprow .dropdown,.row .dropdown{flex:1 1 auto;min-width:0;}
+  .browse-bar .dropdown{width:260px;flex:none;}
+  .row .dropdown-trigger{padding:5px 8px;font-size:12px;background:var(--bg);}
+  .dropdown-trigger{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;
+    background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 11px;
+    border-radius:var(--r);font-size:13px;cursor:pointer;text-align:left;
+    transition:border-color .15s,box-shadow .15s;}
+  .dropdown-trigger:hover,.dropdown-trigger.open{border-color:var(--accent);box-shadow:var(--ring);}
+  .dropdown-trigger.disabled{opacity:.6;cursor:default;box-shadow:none;border-color:var(--border);}
+  .dropdown-value{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .dropdown-trigger svg{flex:none;color:var(--text-muted);transition:transform .15s;}
+  .dropdown-trigger.open svg{transform:rotate(180deg);}
+  .dropdown-menu{position:fixed;background:var(--surface);border:1px solid var(--border-2);
+    border-radius:var(--r);box-shadow:var(--sh-lg);padding:5px;z-index:300;overflow:auto;
+    animation:ddrop .12s ease-out;}
+  @keyframes ddrop{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+  .dropdown-item{display:block;width:100%;background:transparent;border:none;text-align:left;padding:8px 11px;
+    border-radius:6px;color:var(--text);font-size:13px;cursor:pointer;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;transition:background .1s,color .1s;}
+  .dropdown-item:hover{background:var(--accent-soft);color:var(--accent);}
+  .dropdown-item.active{background:var(--surface-2);color:var(--accent);font-weight:600;}
   /* per-class visibility rows */
   .collapse-h{cursor:pointer;user-select:none;display:flex;align-items:center;gap:7px;}
   .collapse-h #viscaret{color:var(--text-muted);display:inline-flex;width:12px;transition:transform .15s;}
@@ -1581,13 +1604,14 @@ HTML = r"""<!DOCTYPE html>
              filter:drop-shadow(0 10px 28px rgba(110,168,254,.25));}
   .home-title{font-size:32px;margin:0 0 6px;color:var(--text);font-weight:700;letter-spacing:-.5px;}
   .home-sub{color:var(--text-muted);margin:0 0 32px;font-size:14.5px;}
-  .home-cards{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;}
-  .home-card{width:280px;background:var(--surface);border:1px solid var(--border);border-radius:16px;
-             padding:24px 22px;cursor:pointer;text-align:left;box-shadow:var(--sh-sm);
+  .home-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;}
+  .home-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;
+             padding:22px;cursor:pointer;text-align:left;box-shadow:var(--sh-sm);
+             display:flex;flex-direction:column;
              transition:transform .14s,border-color .14s,box-shadow .14s;}
   .home-card:hover{transform:translateY(-4px);border-color:var(--border-2);box-shadow:var(--sh-md);}
-  .hc-icon{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;
-           margin-bottom:16px;background:var(--accent-soft);color:var(--accent);}
+  .hc-icon{width:46px;height:46px;border-radius:13px;display:flex;align-items:center;justify-content:center;
+           margin-bottom:15px;background:var(--accent-soft);color:var(--accent);}
   .home-card.cvat .hc-icon{background:var(--ok-soft);color:var(--ok);}
   .home-card.auto .hc-icon{background:rgba(251,191,36,.14);color:var(--warn);}
   .home-card.count .hc-icon{background:rgba(167,139,250,.15);color:#a78bfa;}
@@ -1629,11 +1653,12 @@ HTML = r"""<!DOCTYPE html>
                grid-template-columns:repeat(auto-fill,minmax(240px,1fr));}
   .browse-empty{color:var(--text-dim);padding:20px;font-size:14px;}
   .bcard{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px;
-         cursor:pointer;box-shadow:var(--sh-sm);transition:transform .12s,border-color .12s,box-shadow .12s;}
-  .bcard:hover{transform:translateY(-3px);border-color:var(--border-2);box-shadow:var(--sh-md);}
-  .bcard .bc-id{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ok);}
-  .bcard .bc-name{font-size:15px;font-weight:600;color:var(--text);margin:6px 0;word-break:break-word;letter-spacing:-.2px;}
-  .bcard .bc-sub{font-size:12px;color:var(--text-muted);display:inline-flex;align-items:center;gap:5px;}
+         cursor:pointer;box-shadow:var(--sh-sm);display:flex;flex-direction:column;gap:6px;
+         transition:transform .12s,border-color .12s,box-shadow .12s;}
+  .bcard:hover{transform:translateY(-3px);border-color:var(--accent);box-shadow:var(--sh-md);}
+  .bcard .bc-id{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--ok);}
+  .bcard .bc-name{font-size:15px;font-weight:600;color:var(--text);word-break:break-word;letter-spacing:-.2px;flex:1;}
+  .bcard .bc-sub{font-size:12px;color:var(--text-muted);display:inline-flex;align-items:center;gap:5px;margin-top:2px;}
   .browse-prog{position:absolute;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(2px);display:flex;
                align-items:center;justify-content:center;}
   .bp-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:26px;
@@ -2003,7 +2028,7 @@ function setActiveClass(i){
   const max = (classes.length||1)-1;
   if(i>max) return;
   activeClass=i;
-  document.getElementById('classsel').value=String(i);
+  document.getElementById('classsel').value=String(i); syncDD(document.getElementById('classsel'));
   const ac=document.getElementById('activeclass');
   ac.innerHTML='class: <span class="sw" style="background:'+classColor(i)+'"></span> '
     +'<b>'+escapeHtml(className(i))+'</b> ('+i+')';
@@ -2012,6 +2037,71 @@ function setActiveClass(i){
 }
 function escapeHtml(s){ return String(s).replace(/[&<>"]/g,c=>(
   {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// ---- custom dropdowns: replace a native <select> with a styled menu whose
+//      options highlight on hover. The native select stays (hidden) as the
+//      source of truth so existing value reads / change handlers keep working.
+const _DD_CHEV='<svg viewBox="0 0 12 7" width="11" height="7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 1 6 6 11 1"/></svg>';
+let _ddCloseOpen=null;
+function syncDD(sel){ if(sel && sel._ddSync) sel._ddSync(); }
+// drop menus whose trigger left the DOM (re-rendered lists), so none leak
+function _ddCleanup(){ document.querySelectorAll('body > .dropdown-menu').forEach(m=>{
+  if(m._trg && !m._trg.isConnected) m.remove(); }); }
+function enhanceSelect(sel){
+  if(!sel || sel.dataset.dd) return; sel.dataset.dd='1'; _ddCleanup();
+  sel.style.display='none';
+  const wrap=document.createElement('div'); wrap.className='dropdown';
+  const trg=document.createElement('button'); trg.type='button'; trg.className='dropdown-trigger';
+  trg.innerHTML='<span class="dropdown-value"></span>'+_DD_CHEV;
+  wrap.appendChild(trg);
+  sel.parentNode.insertBefore(wrap, sel);
+  // the menu lives at body level (fixed) so scrollable panels never clip it
+  const menu=document.createElement('div'); menu.className='dropdown-menu'; menu.style.display='none';
+  menu._trg=trg; document.body.appendChild(menu);
+  function sync(){
+    const cur=sel.options[sel.selectedIndex];
+    trg.querySelector('.dropdown-value').textContent = cur?cur.textContent:'';
+    trg.classList.toggle('disabled', !!sel.disabled);
+    for(let i=0;i<menu.children.length;i++) menu.children[i].classList.toggle('active', i===sel.selectedIndex);
+  }
+  function rebuild(){
+    menu.innerHTML='';
+    for(let i=0;i<sel.options.length;i++){
+      const o=sel.options[i];
+      const it=document.createElement('button'); it.type='button'; it.className='dropdown-item';
+      it.textContent=o.textContent;
+      it.addEventListener('click',()=>{
+        if(sel.value!==o.value){ sel.value=o.value; sel.dispatchEvent(new Event('change',{bubbles:true})); }
+        close(); sync();
+      });
+      menu.appendChild(it);
+    }
+    sync();
+  }
+  function place(){
+    const r=trg.getBoundingClientRect();
+    menu.style.left=r.left+'px'; menu.style.width=r.width+'px';
+    const below=window.innerHeight-r.bottom-8, above=r.top-8;
+    if(below<160 && above>below){           // not enough room below -> open upward
+      menu.style.top='auto'; menu.style.bottom=(window.innerHeight-r.top+6)+'px';
+      menu.style.maxHeight=Math.min(300,above)+'px';
+    } else {
+      menu.style.bottom='auto'; menu.style.top=(r.bottom+6)+'px';
+      menu.style.maxHeight=Math.max(120,Math.min(300,below))+'px';
+    }
+  }
+  function close(){ menu.style.display='none'; trg.classList.remove('open'); if(_ddCloseOpen===close)_ddCloseOpen=null; }
+  function open(){ if(sel.disabled) return; if(_ddCloseOpen)_ddCloseOpen(); place(); menu.style.display='block'; trg.classList.add('open'); _ddCloseOpen=close; }
+  trg.addEventListener('click',e=>{ e.stopPropagation(); (menu.style.display==='none')?open():close(); });
+  menu.addEventListener('mousedown',e=>e.stopPropagation());
+  new MutationObserver(rebuild).observe(sel,{childList:true,subtree:true});
+  sel.addEventListener('change',sync);
+  sel._ddSync=sync;
+  rebuild();
+}
+function enhanceSelects(ids){ ids.forEach(id=>{ const e=document.getElementById(id); if(e) enhanceSelect(e); }); }
+document.addEventListener('mousedown',()=>{ if(_ddCloseOpen) _ddCloseOpen(); });
+window.addEventListener('scroll',()=>{ if(_ddCloseOpen) _ddCloseOpen(); }, true);
 
 // ---- normalised <-> pixel helpers ----
 function toPix(b){
@@ -2089,6 +2179,9 @@ function draw(){
 function renderPanel(){
   const list=document.getElementById('list');
   if(!list) return;
+  // skip rebuild when nothing the panel shows changed (draw() runs on every drag move)
+  const sig=boxes.map(b=>b.cls).join(',')+'|'+sel+'|'+[...hiddenClasses].join(',')+'|'+classes.length;
+  if(sig===list._sig) return; list._sig=sig;
   const opts=(cur)=>{
     const names = classes.length ? classes : ['class 0'];
     return names.map((n,i)=>'<option value="'+i+'"'+(i===cur?' selected':'')+'>'
@@ -2114,6 +2207,7 @@ function renderPanel(){
     });
   }
   list.innerHTML=html;
+  list.querySelectorAll('select').forEach(enhanceSelect);
 }
 
 function selectBox(i){ sel=i; draw(); }
@@ -2240,7 +2334,7 @@ cv.addEventListener('mousedown', e=>{
 // update the active-class indicator to match a clicked box, without re-applying
 function setActiveClassSilent(i){
   if(i<0) return; const max=(classes.length||1)-1; if(i>max) return;
-  activeClass=i; document.getElementById('classsel').value=String(i);
+  activeClass=i; document.getElementById('classsel').value=String(i); syncDD(document.getElementById('classsel'));
   const ac=document.getElementById('activeclass');
   ac.innerHTML='class: <span class="sw" style="background:'+classColor(i)+'"></span> '
     +'<b>'+escapeHtml(className(i))+'</b> ('+i+')';
@@ -2408,6 +2502,7 @@ function buildAaMap(){
       +escapeHtml(mn)+'</span><span class="arr">→</span>'
       +'<select data-mi="'+mi+'">'+opts(m===undefined?-1:m)+'</select></div>';
   }).join('');
+  host.querySelectorAll('select').forEach(enhanceSelect);
 }
 async function openAaModal(){
   document.getElementById('aamodal').style.display='flex';
@@ -2575,7 +2670,7 @@ async function openCvModal(){
   // populate the modal's project dropdown; preselect sidebar pick if any
   const side=document.getElementById('cvatproj').value;
   await loadCvUploadProjects();
-  if(side) document.getElementById('cvUploadProj').value=side;
+  if(side){ document.getElementById('cvUploadProj').value=side; syncDD(document.getElementById('cvUploadProj')); }
   cvUpdateToggle();
   // if an upload is already running, jump straight to its progress
   try{
@@ -2833,6 +2928,7 @@ function buildApMap(){
       +escapeHtml(mn)+'</span><span class="arr">→</span>'
       +'<select data-mi="'+mi+'">'+opts(match||'')+'</select></div>';
   }).join('');
+  host.querySelectorAll('select').forEach(enhanceSelect);
 }
 async function runAutoPipeline(){
   const tasks=apCheckedTasks();
@@ -3169,6 +3265,8 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   buildClassUI();
   updateNav();
   applyMode();                 // default to Local (CVAT section hidden until chosen)
+  enhanceSelects(['classsel','cvatproj','aamodel','aatarget','aamode','apmodel',
+                  'approj','apmode','cvUploadProj','ccproj']);   // styled dropdowns
   loadCvatProjects();          // populate the CVAT project dropdown in the background
   if(!count){ setStatus('no images in '+(m.path||'')+' — set a folder above'); return; }
   load(0);
