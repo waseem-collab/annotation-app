@@ -70,7 +70,7 @@ IMG_EXTS = (".jpg", ".jpeg", ".png")
 
 def _remembered_folder(default):
     try:
-        with open(STATE_FILE) as fh:
+        with open(STATE_FILE, encoding="utf-8") as fh:
             p = fh.read().strip()
         if p and os.path.isdir(os.path.join(p, "images")):
             return p
@@ -81,7 +81,7 @@ def _remembered_folder(default):
 
 def _remember_folder(path):
     try:
-        with open(STATE_FILE, "w") as fh:
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
             fh.write(path)
     except OSError:
         pass
@@ -123,7 +123,7 @@ def read_classes():
         p = os.path.join(DATA, fname)
         if os.path.isfile(p):
             try:
-                with open(p) as fh:
+                with open(p, encoding="utf-8") as fh:
                     names = [ln.strip() for ln in fh.read().splitlines()]
                 names = [n for n in names if n != ""]
                 if names:
@@ -146,7 +146,7 @@ def label_path_for(img_name):
 def _read_label_file(p):
     boxes = []
     if os.path.exists(p):
-        with open(p) as fh:
+        with open(p, encoding="utf-8") as fh:
             for line in fh:
                 parts = line.split()
                 if len(parts) < 5:
@@ -175,7 +175,7 @@ def _write_label_file(path, boxes):
             continue
         cls = int(b.get("cls", 0))
         lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-    with open(path, "w") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
         if lines:
             fh.write("\n")
@@ -192,7 +192,7 @@ def _linked_task():
     """If the current folder was imported from a CVAT task, return its info
     (includes the full frame map for upload use)."""
     try:
-        with open(os.path.join(DATA, ".cvat_task.json")) as fh:
+        with open(os.path.join(DATA, ".cvat_task.json"), encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return None
@@ -316,7 +316,7 @@ def _build_yolo_zip(images, classes, lbl_dir, zip_path):
             lbl = os.path.join(lbl_dir, stem + ".txt")
             content = ""
             if os.path.exists(lbl):
-                with open(lbl) as fh:
+                with open(lbl, encoding="utf-8") as fh:
                     content = fh.read()
             z.writestr(f"obj_train_data/{stem}.txt", content)
             train_lines.append(f"data/obj_train_data/{img}")
@@ -344,7 +344,7 @@ def _build_update_zip(lbl_dir, classes, frames, subset, zip_path):
             lp = os.path.join(lbl_dir, stem_base + ".txt")
             content = ""
             if os.path.exists(lp):
-                with open(lp) as fh:
+                with open(lp, encoding="utf-8") as fh:
                     content = fh.read()
             frame_stem = os.path.splitext(frame)[0]
             z.writestr(f"{folder}/{frame_stem}.txt", content)
@@ -489,7 +489,7 @@ _cvat_cache_lock = threading.Lock()
 def _load_cvat_cache():
     global _cvat_cache
     try:
-        with open(_CVAT_CACHE_FILE) as fh:
+        with open(_CVAT_CACHE_FILE, encoding="utf-8") as fh:
             d = json.load(fh)
         if isinstance(d, dict):
             _cvat_cache = {"projects": d.get("projects"), "tasks": d.get("tasks") or {}}
@@ -499,7 +499,7 @@ def _load_cvat_cache():
 
 def _save_cvat_cache():
     try:
-        with open(_CVAT_CACHE_FILE, "w") as fh:
+        with open(_CVAT_CACHE_FILE, "w", encoding="utf-8") as fh:
             json.dump(_cvat_cache, fh)
     except OSError:
         pass
@@ -674,11 +674,11 @@ def _extract_yolo_export(zip_path, out_dir):
         names = []
         for root, _, files in os.walk(tmp):
             if "obj.names" in files:
-                with open(os.path.join(root, "obj.names")) as fh:
+                with open(os.path.join(root, "obj.names"), encoding="utf-8") as fh:
                     names = [ln.strip() for ln in fh if ln.strip()]
                 break
         if names:
-            with open(os.path.join(out_dir, "labels.txt"), "w") as fh:
+            with open(os.path.join(out_dir, "labels.txt"), "w", encoding="utf-8") as fh:
                 fh.write("\n".join(names) + "\n")
         frames = {}       # image basename -> frame path inside obj_<subset>_data
         subset = None
@@ -775,7 +775,7 @@ def _local_task_dirs(task_id):
 
 def _classes_in(d):
     try:
-        with open(os.path.join(d, "labels.txt")) as fh:
+        with open(os.path.join(d, "labels.txt"), encoding="utf-8") as fh:
             return [ln.strip() for ln in fh if ln.strip()]
     except OSError:
         return []
@@ -800,7 +800,7 @@ def _cvat_import_task(task_id, status=None, force=False):
     if not force:
         for d in _local_task_dirs(task_id):
             try:
-                with open(os.path.join(d, ".cvat_task.json")) as fh:
+                with open(os.path.join(d, ".cvat_task.json"), encoding="utf-8") as fh:
                     link = json.load(fh)
             except (OSError, ValueError):
                 link = {}
@@ -823,7 +823,7 @@ def _cvat_import_task(task_id, status=None, force=False):
         say("extracting…")
         n, names, frames, subset = _extract_yolo_export(zip_path, out_dir)
         try:
-            with open(os.path.join(out_dir, ".cvat_task.json"), "w") as fh:
+            with open(os.path.join(out_dir, ".cvat_task.json"), "w", encoding="utf-8") as fh:
                 json.dump({"task_id": int(task_id), "task_name": tname,
                            "project_id": info.get("project_id"), "frames": frames,
                            "subset": subset, "updated_date": updated}, fh)
@@ -1280,7 +1280,7 @@ def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf,
             classes = [names[k] for k in sorted(names)]
             data_dir = os.path.dirname(img_dir)
             try:
-                with open(os.path.join(data_dir, "labels.txt"), "w") as fh:
+                with open(os.path.join(data_dir, "labels.txt"), "w", encoding="utf-8") as fh:
                     fh.write("\n".join(classes) + "\n")
                 if data_dir == DATA:
                     CLASSES = list(classes)
