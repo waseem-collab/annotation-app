@@ -1510,6 +1510,13 @@ HTML = r"""<!DOCTYPE html>
     text-overflow:ellipsis;transition:background .1s,color .1s;}
   .dropdown-item:hover{background:var(--accent-soft);color:var(--accent);}
   .dropdown-item.active{background:var(--surface-2);color:var(--accent);font-weight:600;}
+  .dropdown-search{position:sticky;top:-5px;z-index:2;display:block;box-sizing:border-box;
+    width:calc(100% + 10px);margin:-5px -5px 5px;padding:9px 11px;
+    background:var(--surface);border:none;border-bottom:1px solid var(--border-2);
+    color:var(--text);font-size:13px;outline:none;}
+  .dropdown-search::placeholder{color:var(--text-muted);}
+  .dropdown-search:focus{border-bottom-color:var(--accent);}
+  .dropdown-noresult{padding:10px 11px;color:var(--text-muted);font-size:12.5px;text-align:center;}
   /* per-class visibility rows */
   .collapse-h{cursor:pointer;user-select:none;display:flex;align-items:center;gap:7px;}
   .collapse-h #viscaret{color:var(--text-muted);display:inline-flex;width:12px;transition:transform .15s;}
@@ -2111,14 +2118,39 @@ function enhanceSelect(sel){
   // the menu lives at body level (fixed) so scrollable panels never clip it
   const menu=document.createElement('div'); menu.className='dropdown-menu'; menu.style.display='none';
   menu._trg=trg; document.body.appendChild(menu);
+  let searchInp=null, itemsWrap=null;
   function sync(){
     const cur=sel.options[sel.selectedIndex];
     trg.querySelector('.dropdown-value').textContent = cur?cur.textContent:'';
     trg.classList.toggle('disabled', !!sel.disabled);
-    for(let i=0;i<menu.children.length;i++) menu.children[i].classList.toggle('active', i===sel.selectedIndex);
+    if(!itemsWrap) return;
+    const items=itemsWrap.querySelectorAll('.dropdown-item');
+    for(let i=0;i<items.length;i++) items[i].classList.toggle('active', i===sel.selectedIndex);
+  }
+  function applyFilter(q){
+    if(!itemsWrap) return;
+    q=(q||'').trim().toLowerCase();
+    let any=false;
+    itemsWrap.querySelectorAll('.dropdown-item').forEach(it=>{
+      const m=!q || it.textContent.toLowerCase().includes(q);
+      it.style.display=m?'block':'none'; if(m)any=true;
+    });
+    let nr=itemsWrap.querySelector('.dropdown-noresult');
+    if(!any){ if(!nr){ nr=document.createElement('div'); nr.className='dropdown-noresult'; nr.textContent='No matches'; itemsWrap.appendChild(nr);} nr.style.display='block'; }
+    else if(nr){ nr.style.display='none'; }
   }
   function rebuild(){
-    menu.innerHTML='';
+    menu.innerHTML=''; searchInp=null;
+    if(sel.options.length>8){
+      searchInp=document.createElement('input'); searchInp.type='text'; searchInp.className='dropdown-search';
+      searchInp.placeholder='Search by id or name…';
+      searchInp.addEventListener('input',()=>applyFilter(searchInp.value));
+      searchInp.addEventListener('mousedown',e=>e.stopPropagation());
+      searchInp.addEventListener('click',e=>e.stopPropagation());
+      searchInp.addEventListener('keydown',e=>{ if(e.key==='Escape')close(); e.stopPropagation(); });
+      menu.appendChild(searchInp);
+    }
+    itemsWrap=document.createElement('div'); itemsWrap.className='dropdown-items';
     for(let i=0;i<sel.options.length;i++){
       const o=sel.options[i];
       const it=document.createElement('button'); it.type='button'; it.className='dropdown-item';
@@ -2127,8 +2159,9 @@ function enhanceSelect(sel){
         if(sel.value!==o.value){ sel.value=o.value; sel.dispatchEvent(new Event('change',{bubbles:true})); }
         close(); sync();
       });
-      menu.appendChild(it);
+      itemsWrap.appendChild(it);
     }
+    menu.appendChild(itemsWrap);
     sync();
   }
   function place(){
@@ -2144,7 +2177,8 @@ function enhanceSelect(sel){
     }
   }
   function close(){ menu.style.display='none'; trg.classList.remove('open'); if(_ddCloseOpen===close)_ddCloseOpen=null; }
-  function open(){ if(sel.disabled) return; if(_ddCloseOpen)_ddCloseOpen(); place(); menu.style.display='block'; trg.classList.add('open'); _ddCloseOpen=close; }
+  function open(){ if(sel.disabled) return; if(_ddCloseOpen)_ddCloseOpen(); place(); menu.style.display='block'; trg.classList.add('open'); _ddCloseOpen=close;
+    if(searchInp){ searchInp.value=''; applyFilter(''); setTimeout(()=>{try{searchInp.focus();}catch(e){}},0); } menu.scrollTop=0; }
   trg.addEventListener('click',e=>{ e.stopPropagation(); (menu.style.display==='none')?open():close(); });
   menu.addEventListener('mousedown',e=>e.stopPropagation());
   new MutationObserver(rebuild).observe(sel,{childList:true,subtree:true});
@@ -2153,8 +2187,8 @@ function enhanceSelect(sel){
   rebuild();
 }
 function enhanceSelects(ids){ ids.forEach(id=>{ const e=document.getElementById(id); if(e) enhanceSelect(e); }); }
-document.addEventListener('mousedown',()=>{ if(_ddCloseOpen) _ddCloseOpen(); });
-window.addEventListener('scroll',()=>{ if(_ddCloseOpen) _ddCloseOpen(); }, true);
+document.addEventListener('mousedown',(e)=>{ if(_ddCloseOpen && !(e.target.closest && e.target.closest('.dropdown-menu'))) _ddCloseOpen(); });
+window.addEventListener('scroll',(e)=>{ if(!_ddCloseOpen) return; if(e.target && e.target.closest && e.target.closest('.dropdown-menu')) return; _ddCloseOpen(); }, true);
 
 // ---- normalised <-> pixel helpers ----
 function toPix(b){
