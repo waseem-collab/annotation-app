@@ -1719,15 +1719,17 @@ HTML = r"""<!DOCTYPE html>
       <button class="wide ok" onclick="openAaModal()">Automatic annotation…</button>
     </div>
     <div class="lp-sec" id="cvatsec">
-      <h4>CVAT project</h4>
-      <div class="lp-row">
-        <select id="cvatproj" onchange="onCvatProjPick()"><option value="">— loading projects… —</option></select>
-        <button id="cvatlock" class="lockbtn" title="lock project" onclick="toggleCvatLock()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.5"/></svg></button>
+      <h4>CVAT</h4>
+      <div id="cvatProjWrap">
+        <div class="lp-row">
+          <select id="cvatproj" onchange="onCvatProjPick()"><option value="">— loading projects… —</option></select>
+          <button id="cvatlock" class="lockbtn" title="lock project" onclick="toggleCvatLock()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.5"/></svg></button>
+        </div>
+        <button class="wide" onclick="loadCvatProjects(true)">Refresh list</button>
+        <button class="wide" onclick="openCvatBrowse()">Import from CVAT…</button>
+        <div id="cvatstatus"></div>
       </div>
-      <button class="wide" onclick="loadCvatProjects(true)">Refresh list</button>
-      <button class="wide" id="cvatImportBtn" onclick="openCvatBrowse()">Import from CVAT…</button>
       <button class="wide ok" onclick="openCvModal()">Upload to CVAT…</button>
-      <div id="cvatstatus"></div>
     </div>
   </div>
 
@@ -1807,7 +1809,10 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div id="cvnewwrap">
           <label>Project</label>
-          <div id="cvtarget" class="cvtarget">— select a project in the sidebar —</div>
+          <div class="selrow">
+            <select id="cvUploadProj" onchange="updateCvRunState()"><option value="">— select project —</option></select>
+            <button onclick="loadCvUploadProjects(true)" title="refresh projects"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
+          </div>
           <label>Task name</label>
           <input id="cvattask" type="text" placeholder="task name">
         </div>
@@ -2124,10 +2129,10 @@ function removeBox(i){
 // ---- landing screen + mode ----
 let appMode='local';   // 'local' = no CVAT options, 'cvat' = import/upload available
 function applyMode(){
-  // CVAT section (project + Upload) is available in both modes; only "Import
-  // from CVAT" is hidden in local mode.
+  // Local mode is clean: only the "Upload to CVAT" button (the upload modal picks
+  // the project itself). CVAT mode also shows project select / import.
   document.getElementById('cvatsec').style.display='block';
-  document.getElementById('cvatImportBtn').style.display = appMode==='cvat' ? '' : 'none';
+  document.getElementById('cvatProjWrap').style.display = appMode==='cvat' ? 'block' : 'none';
   updateModeBadge();
 }
 function updateModeBadge(){
@@ -2539,9 +2544,21 @@ function cvUpdateToggle(){
 function updateCvRunState(){
   const run=document.getElementById('cvrun');
   if(cvIsUpdate()){ run.disabled=false; cvMsg(''); return; }
-  const sel=document.getElementById('cvatproj');
-  if(sel.value){ run.disabled=false; cvMsg(''); }
-  else { run.disabled=true; cvMsg('pick a CVAT project on the left first'); }
+  if(document.getElementById('cvUploadProj').value){ run.disabled=false; cvMsg(''); }
+  else { run.disabled=true; cvMsg('select a project to upload into'); }
+}
+// the upload modal carries its own project dropdown (cached list)
+async function loadCvUploadProjects(refresh){
+  const sel=document.getElementById('cvUploadProj'); const prev=sel.value;
+  sel.innerHTML='<option value="">loading…</option>';
+  try{
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; return; }
+    sel.innerHTML='<option value="">— select project —</option>'
+      +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
+    if(prev) sel.value=prev;
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; }
+  updateCvRunState();
 }
 async function openCvModal(){
   document.getElementById('cvmodal').style.display='flex';
@@ -2554,11 +2571,10 @@ async function openCvModal(){
       +(linkedTask.task_name?(' ('+linkedTask.task_name+')'):'');
     document.getElementById('cvupdate').checked=true;
   } else lw.style.display='none';
-  // reflect the project chosen in the sidebar (for create-new)
-  const sel=document.getElementById('cvatproj');
-  const tgt=document.getElementById('cvtarget');
-  tgt.textContent = sel.value ? sel.options[sel.selectedIndex].text
-                              : '— select a project in the sidebar —';
+  // populate the modal's project dropdown; preselect sidebar pick if any
+  const side=document.getElementById('cvatproj').value;
+  await loadCvUploadProjects();
+  if(side) document.getElementById('cvUploadProj').value=side;
   cvUpdateToggle();
   // if an upload is already running, jump straight to its progress
   try{
@@ -2573,9 +2589,9 @@ async function runCvatUpload(){
   if(updating){
     body={task_id:linkedTask.task_id, classes};
   } else {
-    const pid=document.getElementById('cvatproj').value;
+    const pid=document.getElementById('cvUploadProj').value;
     const tname=document.getElementById('cvattask').value.trim();
-    if(!pid){ cvMsg('select a project in the sidebar'); return; }
+    if(!pid){ cvMsg('select a project to upload into'); return; }
     if(!tname){ cvMsg('enter a task name'); return; }
     body={project_id:pid, task_name:tname, classes};
   }
