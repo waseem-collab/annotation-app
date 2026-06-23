@@ -1682,6 +1682,24 @@ HTML = r"""<!DOCTYPE html>
              filter:drop-shadow(0 10px 28px rgba(110,168,254,.25));}
   .home-title{font-size:32px;margin:0 0 6px;color:var(--text);font-weight:700;letter-spacing:-.5px;}
   .home-sub{color:var(--text-muted);margin:0 0 32px;font-size:14.5px;}
+  .continue-card{display:flex;align-items:center;gap:15px;width:100%;box-sizing:border-box;
+    background:var(--surface);border:1px solid var(--accent);border-radius:14px;padding:15px 18px;
+    margin-bottom:18px;cursor:pointer;text-align:left;box-shadow:var(--sh-sm);font:inherit;color:inherit;
+    transition:transform .12s,border-color .12s,box-shadow .12s,background .12s;}
+  .continue-card:hover{transform:translateY(-2px);box-shadow:var(--sh-md);background:var(--surface-2);}
+  .continue-card .cont-icon{flex:none;width:44px;height:44px;border-radius:11px;display:flex;
+    align-items:center;justify-content:center;background:var(--accent-soft);color:var(--accent);}
+  .continue-card .cont-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;}
+  .cont-eyebrow{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent);}
+  .cont-name-row{display:flex;align-items:center;gap:9px;min-width:0;}
+  .cont-name{font-size:15.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .cont-badge{flex:none;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;
+    padding:2px 8px;border-radius:999px;line-height:1.5;}
+  .cont-badge.local{background:var(--accent-soft);color:var(--accent);}
+  .cont-badge.cvat{background:var(--ok-soft);color:var(--ok);}
+  .cont-meta{font-size:12.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .continue-card .cont-arrow{flex:none;color:var(--text-muted);transition:color .12s,transform .12s;}
+  .continue-card:hover .cont-arrow{color:var(--accent);transform:translateX(3px);}
   .home-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;}
   .home-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;
              padding:22px;cursor:pointer;text-align:left;box-shadow:var(--sh-sm);
@@ -1759,6 +1777,15 @@ HTML = r"""<!DOCTYPE html>
     <svg class="home-logo" viewBox="0 0 64 64"><defs><linearGradient id="alg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6ea8fe"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect width="64" height="64" rx="15" fill="url(#alg2)"/><g stroke="#0a0a0a" stroke-width="3.4" stroke-linecap="round" fill="none" opacity=".88"><path d="M16 25v-7a2 2 0 0 1 2-2h7"/><path d="M48 25v-7a2 2 0 0 0-2-2h-7"/><path d="M16 39v7a2 2 0 0 0 2 2h7"/><path d="M48 39v7a2 2 0 0 1-2 2h-7"/></g><circle cx="32" cy="32" r="4.6" fill="#0a0a0a"/></svg>
     <h1 class="home-title">Annotation Studio</h1>
     <p class="home-sub">Choose how to start</p>
+    <button id="continueCard" class="continue-card" style="display:none" onclick="continueLastSession()">
+      <span class="cont-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="22" height="22" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M10 9l5 3-5 3z" fill="currentColor" stroke="none"/></svg></span>
+      <span class="cont-body">
+        <span class="cont-eyebrow">Continue last session</span>
+        <span class="cont-name-row"><span class="cont-name" id="contName"></span><span class="cont-badge" id="contBadge"></span></span>
+        <span class="cont-meta" id="contMeta"></span>
+      </span>
+      <svg class="cont-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" width="20" height="20" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>
+    </button>
     <div class="home-cards">
       <div class="home-card local" onclick="enterLocal()">
         <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
@@ -2385,6 +2412,28 @@ function enterImport(){
   openCvatBrowse();
 }
 function goHome(){ hideAllScreens(); document.getElementById('home').style.display='flex'; }
+// resume the last opened folder, in the mode it belongs to (local, or CVAT if it
+// was an imported task). The folder is already loaded server-side at startup.
+function continueLastSession(){
+  if(!count){ setStatus('no previous session'); return; }
+  appMode = linkedTask ? 'cvat' : 'local'; applyMode();
+  hideAllScreens();
+  if(img.complete && img.naturalWidth){ fit(); draw(); }
+  else { load(typeof idx==='number'?idx:0); }
+}
+// fill in the "continue last session" banner on the home page (if any)
+function showContinueCard(m){
+  const cc=document.getElementById('continueCard'); if(!cc) return;
+  if(!(m && m.count && m.path)){ cc.style.display='none'; return; }
+  const base=(String(m.path).split(/[\\/]/).filter(Boolean).pop())||m.path;
+  document.getElementById('contName').textContent=base;
+  const isCvat=!!m.linked_task, b=document.getElementById('contBadge');
+  b.textContent=isCvat?'From CVAT':'Local'; b.className='cont-badge '+(isCvat?'cvat':'local');
+  let meta=m.count+' image'+(m.count===1?'':'s');
+  if(isCvat){ const lt=m.linked_task; meta+=' · task '+(lt.task_name?lt.task_name:('#'+lt.task_id)); }
+  document.getElementById('contMeta').textContent=meta;
+  cc.style.display='flex';
+}
 
 // delete the current image (and its label) from disk, then advance
 async function deleteImage(){
@@ -3445,6 +3494,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   buildClassUI();
   updateNav();
   applyMode();                 // default to Local (CVAT section hidden until chosen)
+  showContinueCard(m);         // offer to resume the last session from the home page
   enhanceSelects(['classsel','cvatproj','aamodel','aatarget','aamode','apmodel',
                   'approj','apmode','cvUploadProj','ccproj','clsproj']);  // styled dropdowns
   loadCvatProjects();          // populate the CVAT project dropdown in the background
