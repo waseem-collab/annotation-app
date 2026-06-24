@@ -1007,6 +1007,70 @@ def api_cvat_importstatus():
 
 
 # --------------------------------------------------------------------------- #
+# Update-all: refresh every imported task in a project that's out of date.
+# Reuses _cvat_import_task (non-force), which skips copies already current.
+# --------------------------------------------------------------------------- #
+_updall_job = {"running": False, "state": "idle", "message": "", "total": 0,
+               "done": 0, "updated": 0, "uptodate": 0, "failed": 0, "error": None}
+_updall_lock = threading.Lock()
+
+
+def _set_updall(**kw):
+    with _updall_lock:
+        _updall_job.update(kw)
+
+
+def _do_update_all(task_ids):
+    try:
+        total = len(task_ids)
+        updated = uptodate = failed = 0
+        for i, tid in enumerate(task_ids, 1):
+            _set_updall(done=i - 1, message=f"checking task {tid} ({i}/{total})…")
+            try:
+                r = _cvat_import_task(
+                    tid, status=lambda m: _set_updall(message=f"[{i}/{total}] {m}"))
+                if r.get("cached"):
+                    uptodate += 1
+                else:
+                    updated += 1
+            except Exception as e:
+                failed += 1
+                _set_updall(message=f"task {tid} failed: {e}")
+            _set_updall(done=i, updated=updated, uptodate=uptodate, failed=failed)
+        msg = f"done ✓ — {updated} updated, {uptodate} already current"
+        if failed:
+            msg += f", {failed} failed"
+        _set_updall(running=False, state="done", message=msg)
+    except Exception as e:
+        _set_updall(running=False, state="error", error=str(e),
+                    message=f"update-all failed: {e}")
+
+
+@app.route("/api/cvat/updateall", methods=["POST"])
+def api_cvat_updateall():
+    data = request.get_json(force=True) or {}
+    task_ids = [t for t in (data.get("task_ids") or []) if _local_task_dirs(t)]
+    if not task_ids:
+        return jsonify({"error": "no imported tasks to update"}), 400
+    if not (CVAT_URL and CVAT_USER and CVAT_PASS):
+        return jsonify({"error": "CVAT credentials missing in .env"}), 400
+    with _updall_lock:
+        if _updall_job["running"]:
+            return jsonify({"error": "an update is already running"}), 409
+        _updall_job.update(running=True, state="starting", message="starting…",
+                           total=len(task_ids), done=0, updated=0, uptodate=0,
+                           failed=0, error=None)
+    threading.Thread(target=_do_update_all, args=(task_ids,), daemon=True).start()
+    return jsonify({"started": True, "count": len(task_ids)})
+
+
+@app.route("/api/cvat/updateall_status")
+def api_cvat_updateall_status():
+    with _updall_lock:
+        return jsonify(dict(_updall_job))
+
+
+# --------------------------------------------------------------------------- #
 # Auto-annotation pipeline: import task -> run model -> update CVAT
 # --------------------------------------------------------------------------- #
 _ap_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
@@ -2123,6 +2187,7 @@ HTML = r"""<!DOCTYPE html>
     <button id="browseBack" onclick="browseProjects()" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Projects</button>
     <span id="browseTitle" class="browse-title">Import from CVAT — projects</span>
     <span class="spacer"></span>
+    <button id="browseUpdateAll" onclick="updateAllTasks()" title="update all imported tasks in this project" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>Update all</button>
     <button onclick="browseRefresh()" title="refresh"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>Refresh</button>
   </div>
   <div id="browseGrid" class="browse-grid"></div>
@@ -3162,6 +3227,7 @@ async function returnToTasks(refresh, pidArg){
 async function browseProjects(refresh){
   browseState='projects';
   document.getElementById('browseBack').style.display='none';
+  document.getElementById('browseUpdateAll').style.display='none';
   document.getElementById('browseTitle').textContent='Import from CVAT — projects';
   const grid=document.getElementById('browseGrid');
   grid.innerHTML='<div class="browse-empty">loading projects…</div>';
@@ -3192,6 +3258,8 @@ async function openProject(pid, pname, refresh){
           return bCard(t.id,t.name,(t.size!=null?t.size+' images · ':'')+act,'openTaskIdx('+i+')',taskBadge(t));
         }).join('')
       : '<div class="browse-empty">no tasks in this project</div>';
+    // offer "Update all" only when something is actually imported here
+    document.getElementById('browseUpdateAll').style.display = bTasks.some(t=>t.imported) ? '' : 'none';
   }catch(e){ grid.innerHTML='<div class="browse-empty">failed to load tasks</div>'; }
 }
 function openTaskIdx(i){ const t=bTasks[i]; if(t) openTask(t); }
@@ -3283,6 +3351,37 @@ function browsePollImport(){
 function browseRefresh(){
   if(browseState==='tasks') openProject(browseProjectId, browseProjectName, true);
   else browseProjects(true);
+}
+// update every imported task in this project that's out of date (others are
+// skipped server-side, so it only downloads what actually changed).
+async function updateAllTasks(){
+  const ids = bTasks.filter(t=>t.imported).map(t=>t.id);
+  const prog=document.getElementById('browseProg'), txt=document.getElementById('browseProgText');
+  prog.style.display='flex';
+  if(!ids.length){ txt.textContent='No imported tasks in this project to update.'; return; }
+  txt.textContent='updating '+ids.length+' imported task(s)…';
+  try{
+    const r=await fetch('/api/cvat/updateall',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task_ids:ids})}).then(r=>r.json());
+    if(r.error){ txt.textContent='error: '+r.error; return; }
+    pollUpdateAll();
+  }catch(e){ txt.textContent='request failed'; }
+}
+function pollUpdateAll(){
+  clearInterval(impPoll);
+  impPoll=setInterval(async()=>{
+    let s; try{ s=await fetch('/api/cvat/updateall_status?t='+Date.now()).then(r=>r.json()); }
+    catch(e){ return; }
+    let t=s.message||s.state||'';
+    if(s.running && s.total) t+=' ('+s.done+'/'+s.total+')';
+    document.getElementById('browseProgText').textContent=t;
+    if(!s.running){
+      clearInterval(impPoll);
+      // refresh the grid so the dots/badges reflect the new state
+      setTimeout(()=>{ document.getElementById('browseProg').style.display='none';
+        openProject(browseProjectId, browseProjectName, true); }, 1300);
+    }
+  }, 1000);
 }
 function browseCancelProg(){
   document.getElementById('browseProg').style.display='none';
