@@ -1707,6 +1707,26 @@ HTML = r"""<!DOCTYPE html>
      centred form card), consistent with the Import / Class-count screens */
   #apmodal{z-index:195;}
   .ap-page{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start;padding:30px 20px;}
+  /* minimized auto-annotation: floating progress pill (above everything) */
+  .apw{position:fixed;right:18px;bottom:18px;width:300px;z-index:210;background:var(--surface);
+    border:1px solid var(--border-2);border-radius:var(--r-lg);box-shadow:var(--sh-lg);
+    padding:12px 13px;animation:ddrop .14s ease-out;}
+  .apw-top{display:flex;align-items:center;gap:8px;margin-bottom:9px;}
+  .apw-top .spacer{flex:1;}
+  .apw-dot{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:none;
+    box-shadow:0 0 0 3px rgba(251,191,36,.2);animation:apwpulse 1.2s ease-in-out infinite;}
+  @keyframes apwpulse{0%,100%{opacity:1;}50%{opacity:.35;}}
+  .apw-title{font-size:12.5px;font-weight:600;color:var(--text);}
+  .apw-icon{flex:none;width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+    background:transparent;border:1px solid var(--border);border-radius:7px;color:var(--text-muted);
+    cursor:pointer;transition:background .12s,color .12s;}
+  .apw-icon:hover{background:var(--surface-2);color:var(--text);}
+  .apw-bar{height:6px;background:var(--bg);border-radius:99px;overflow:hidden;}
+  .apw-bar>div{height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .3s;}
+  .apw-text{font-size:11.5px;color:var(--text-muted);margin-top:7px;line-height:1.35;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .apw.done .apw-dot{background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,.2);animation:none;}
+  .apw.done .apw-bar>div{background:var(--ok);}
   .modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);width:360px;
          max-width:92vw;box-shadow:var(--sh-lg);}
   .modal-h{padding:15px 18px;font-size:15px;font-weight:600;border-bottom:1px solid var(--border);}
@@ -1727,6 +1747,7 @@ HTML = r"""<!DOCTYPE html>
   .modal .selrow > button:hover{background:var(--surface-2);color:var(--text);}
   .modal-f{padding:14px 18px;border-top:1px solid var(--border);display:flex;
            justify-content:flex-end;gap:9px;}
+  .modal-f button#apmin{display:inline-flex;align-items:center;gap:6px;}
   .modal-f button{padding:9px 18px;border-radius:var(--r);border:1px solid var(--border);
                   background:transparent;color:var(--text);cursor:pointer;font-size:13px;font-weight:500;
                   transition:background .15s,border-color .15s;}
@@ -2180,12 +2201,25 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="modal-f">
       <button id="apcancel" onclick="closeApModal()">Cancel</button>
+      <button id="apmin" onclick="minimizeAuto()" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg>Minimize</button>
       <button id="apback" onclick="apShowConfig()" style="display:none;">Back</button>
       <button id="apnext" class="ok" onclick="apNext()">Next</button>
       <button id="aprun" class="ok" onclick="runAutoPipeline()" style="display:none;">Run</button>
     </div>
     </div>
   </div>
+</div>
+
+<div id="apwidget" class="apw" style="display:none;">
+  <div class="apw-top">
+    <span class="apw-dot"></span>
+    <span class="apw-title">Auto-annotating…</span>
+    <span class="spacer"></span>
+    <button class="apw-icon" onclick="restoreAuto()" title="open full view"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
+    <button class="apw-icon" onclick="dismissAutoWidget()" title="hide"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+  </div>
+  <div class="apw-bar"><div id="apwbar"></div></div>
+  <div id="apwtext" class="apw-text"></div>
 </div>
 
 <script>
@@ -3260,10 +3294,11 @@ let apModelClasses=[], apProjectClasses=[], apPoll=null;
 function apMsg(t){ const e=document.getElementById('apmsg'); if(e) e.textContent=t||''; }
 function apProgText(t){ const e=document.getElementById('approgtext'); if(e) e.textContent=t||''; }
 function apBar(pct){ const e=document.getElementById('apbar'); if(e) e.style.width=Math.max(0,Math.min(100,pct))+'%'; }
-function apButtons(cancel,back,next,run){
+function apButtons(cancel,back,next,run,min){
   document.getElementById('apcancel').style.display=cancel?'':'none';
   document.getElementById('apback').style.display=back?'':'none';
   document.getElementById('apnext').style.display=next?'':'none';
+  document.getElementById('apmin').style.display=min?'':'none';
   const r=document.getElementById('aprun'); r.style.display=run?'':'none'; r.disabled=false;
 }
 function apShowConfig(){
@@ -3284,11 +3319,12 @@ function apShowProgress(){
   document.getElementById('apmap').style.display='none';
   document.getElementById('approg').style.display='block';
   document.getElementById('apcancel').textContent='Close';
-  apButtons(true,false,false,false);
+  apButtons(true,false,false,false,true);   // Minimize available while running
 }
 async function enterAuto(){
   appMode='cvat'; applyMode();
   hideAllScreens();
+  apMinimized=false; apShowWidget(false);   // full view -> no floating widget
   document.getElementById('apmodal').style.display='flex';
   apMsg(''); apShowConfig();
   document.getElementById('aptasklist').innerHTML='<div class="apt-empty">— select a project first —</div>';
@@ -3303,6 +3339,30 @@ function closeApModal(){
   document.getElementById('apmodal').style.display='none';
   goHome();                 // standalone flow: return to the landing screen
 }
+// ---- minimize the running pipeline to a floating widget ----
+let apMinimized=false;
+function apShowWidget(on){ const w=document.getElementById('apwidget'); if(w) w.style.display=on?'block':'none'; }
+function apSetWidget(pct,text,done){
+  const bar=document.getElementById('apwbar'), t=document.getElementById('apwtext'), w=document.getElementById('apwidget');
+  if(bar) bar.style.width=Math.max(0,Math.min(100,pct))+'%';
+  if(t) t.textContent=text||'';
+  if(w){ w.classList.toggle('done',!!done);
+    w.querySelector('.apw-title').textContent = done ? 'Auto-annotation done' : 'Auto-annotating…'; }
+}
+function minimizeAuto(){
+  apMinimized=true;
+  document.getElementById('apmodal').style.display='none';   // reveal whatever is behind (editor)
+  apShowWidget(true);
+}
+function restoreAuto(){
+  apMinimized=false;
+  apShowWidget(false);
+  appMode='cvat'; applyMode();
+  hideAllScreens();
+  document.getElementById('apmodal').style.display='flex';
+  apShowProgress();
+}
+function dismissAutoWidget(){ apMinimized=false; apShowWidget(false); }
 async function loadApProjects(refresh){
   const sel=document.getElementById('approj'); const prev=sel.value;
   sel.innerHTML='<option value="">loading…</option>';
@@ -3407,14 +3467,19 @@ function pollAutoPipeline(){
     // overall progress across all tasks: completed tasks + fraction of current
     const frac = (s.state==='annotating' && s.total) ? (s.done/s.total) : 0;
     const pct = s.n_tasks ? Math.round(((s.cur_task-1)+frac)/s.n_tasks*100) : (s.running?5:0);
-    apBar(s.running?Math.max(2,pct):100);
-    apProgText((s.message||s.state||'')+(s.state==='annotating'&&s.total?(' — '+s.done+'/'+s.total):''));
+    const barPct = s.running?Math.max(2,pct):100;
+    let txt = (s.message||s.state||'')+(s.state==='annotating'&&s.total?(' — '+s.done+'/'+s.total):'');
+    apBar(barPct); apProgText(txt);
+    apSetWidget(barPct, txt, false);
     if(!s.running){
       clearInterval(apPoll); apBar(100);
       document.getElementById('apcancel').textContent='Done';
-      if(s.error) apProgText('failed: '+s.error);
-      else apProgText('done ✓ — '+s.added+' boxes across '+(s.done_tasks||s.n_tasks)+' task(s)'
-        +(s.task_url?' · '+s.task_url:''));
+      if(s.error){ apProgText('failed: '+s.error); apSetWidget(100,'failed: '+s.error,true); }
+      else {
+        const done='done ✓ — '+s.added+' boxes across '+(s.done_tasks||s.n_tasks)+' task(s)'
+          +(s.task_url?' · '+s.task_url:'');
+        apProgText(done); apSetWidget(100,done,true);
+      }
     }
   }, 1000);
 }
