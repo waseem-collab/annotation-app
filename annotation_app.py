@@ -68,23 +68,46 @@ STATE_FILE = os.path.join(BASE, ".annotation_app_state")
 IMG_EXTS = (".jpg", ".jpeg", ".png")
 
 
-def _remembered_folder(default):
+def _load_state():
+    """Persisted session state: {path, image, active_class}. Falls back to the
+    legacy plain-text-path format if that's what's on disk."""
     try:
         with open(STATE_FILE, encoding="utf-8") as fh:
-            p = fh.read().strip()
-        if p and os.path.isdir(os.path.join(p, "images")):
-            return p
+            raw = fh.read().strip()
+        if not raw:
+            return {}
+        if raw[0] == "{":
+            return json.loads(raw)
+        return {"path": raw}              # legacy: file held just the folder path
+    except (OSError, ValueError):
+        return {}
+
+
+STATE = _load_state()
+
+
+def _save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(STATE, fh)
     except OSError:
         pass
+
+
+def _remembered_folder(default):
+    p = STATE.get("path")
+    if p and os.path.isdir(os.path.join(p, "images")):
+        return p
     return default
 
 
 def _remember_folder(path):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as fh:
-            fh.write(path)
-    except OSError:
-        pass
+    # switching folders resets the per-folder context (image + active class)
+    if STATE.get("path") != path:
+        STATE["image"] = None
+        STATE["active_class"] = 0
+    STATE["path"] = path
+    _save_state()
 
 
 DATA = _remembered_folder(os.path.join(BASE, "dataset"))
@@ -204,10 +227,56 @@ def _linked_task_public():
     return {k: v for k, v in lt.items() if k != "frames"} if lt else None
 
 
+def _saved_image_index():
+    img = STATE.get("image")
+    if img and img in IMAGES:
+        return IMAGES.index(img)
+    return 0
+
+
 @app.route("/api/meta")
 def api_meta():
     return jsonify({"count": len(IMAGES), "path": DATA, "classes": CLASSES,
-                    "linked_task": _linked_task_public()})
+                    "linked_task": _linked_task_public(),
+                    "last_image": _saved_image_index(),
+                    "active_class": int(STATE.get("active_class") or 0)})
+
+
+@app.route("/api/session", methods=["POST"])
+def api_session():
+    """Persist the working context (current image + active class) so the next
+    launch resumes exactly where the user left off."""
+    d = request.get_json(force=True, silent=True) or {}
+    if "image" in d:
+        STATE["image"] = d["image"]
+    if "active_class" in d:
+        try:
+            STATE["active_class"] = int(d["active_class"])
+        except (TypeError, ValueError):
+            pass
+    STATE["path"] = DATA
+    _save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/classes", methods=["POST"])
+def api_classes():
+    """Persist a class list to the folder's labels.txt (used when classes are
+    imported from CVAT) so they survive a restart."""
+    global CLASSES
+    names = (request.get_json(force=True, silent=True) or {}).get("classes") or []
+    names = [str(n).strip() for n in names if str(n).strip()]
+    if not names:
+        return jsonify({"error": "no classes"}), 400
+    try:
+        with open(os.path.join(DATA, "labels.txt"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(names) + "\n")
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+    CLASSES = names
+    STATE["active_class"] = 0
+    _save_state()
+    return jsonify({"ok": True, "classes": CLASSES})
 
 
 @app.route("/api/setfolder", methods=["POST"])
@@ -2165,6 +2234,7 @@ function setActiveClass(i){
     +'<b>'+escapeHtml(className(i))+'</b> ('+i+')';
   // NB: this only sets the class for NEW boxes. The selected box's class is
   // changed only via the right-panel dropdown (setCls).
+  saveSession();
 }
 function escapeHtml(s){ return String(s).replace(/[&<>"]/g,c=>(
   {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -2285,6 +2355,7 @@ async function load(i){
   img.onload = ()=>{ fit(); draw(); };
   img.src = '/api/image/'+i+'?t='+Date.now();
   setStatus('loaded');
+  saveSession();
 }
 
 let zoom=1, baseW=0, baseH=0;
@@ -2433,6 +2504,24 @@ function showContinueCard(m){
   if(isCvat){ const lt=m.linked_task; meta+=' · task '+(lt.task_name?lt.task_name:('#'+lt.task_id)); }
   document.getElementById('contMeta').textContent=meta;
   cc.style.display='flex';
+}
+
+// remember where we are (current image + active class) so a restart resumes here.
+// throttled, and never writes an empty image (avoids clobbering during boot).
+let _sessTimer=null;
+function saveSession(){
+  clearTimeout(_sessTimer);
+  _sessTimer=setTimeout(()=>{
+    const body={active_class:activeClass};
+    if(name) body.image=name;
+    fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}).catch(()=>{});
+  }, 350);
+}
+// persist an imported class list to the folder's labels.txt so it survives a restart
+async function persistClasses(){
+  try{ await fetch('/api/classes',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({classes})}); }catch(e){}
 }
 
 // delete the current image (and its label) from disk, then advance
@@ -2785,6 +2874,7 @@ async function fetchCvatClasses(){
     if(r.error){ setCvatStatus('error: '+r.error); return; }
     if(!r.classes.length){ setCvatStatus('project '+pid+' has no labels'); return; }
     classes=r.classes; activeClass=0; buildClassUI(); draw();   // recolour with new classes
+    persistClasses();
     setCvatStatus('using '+classes.length+' classes from CVAT project '+pid);
   }catch(e){ setCvatStatus('request failed'); }
 }
@@ -2820,6 +2910,7 @@ async function runImportClasses(){
     if(r.error){ msg.textContent='error: '+r.error; return; }
     if(!r.classes.length){ msg.textContent='project '+pid+' has no labels'; return; }
     classes=r.classes; activeClass=0; buildClassUI(); draw();
+    persistClasses();
     setStatus('imported '+classes.length+' classes from CVAT project '+pid+' ✓');
     closeClsModal();
   }catch(e){ msg.textContent='request failed'; }
@@ -3490,8 +3581,10 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
 (async()=>{
   const m=await fetch('/api/meta').then(r=>r.json());
   count=m.count; classes=m.classes||[]; linkedTask=m.linked_task||null;
+  activeClass = m.active_class||0;            // restore the class we were using
+  const startIdx = m.last_image||0;           // resume on the exact image
   document.getElementById('folder').value = m.path || '';
-  buildClassUI();
+  buildClassUI();              // clamps + applies the restored active class
   updateNav();
   applyMode();                 // default to Local (CVAT section hidden until chosen)
   showContinueCard(m);         // offer to resume the last session from the home page
@@ -3499,7 +3592,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
                   'approj','apmode','cvUploadProj','ccproj','clsproj']);  // styled dropdowns
   loadCvatProjects();          // populate the CVAT project dropdown in the background
   if(!count){ setStatus('no images in '+(m.path||'')+' — set a folder above'); return; }
-  load(0);
+  load(startIdx);
 })();
 </script>
 </body>
