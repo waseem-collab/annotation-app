@@ -1703,8 +1703,10 @@ HTML = r"""<!DOCTYPE html>
   /* modals + progress */
   .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.66);backdrop-filter:blur(2px);z-index:100;
             display:none;align-items:center;justify-content:center;}
-  /* the auto-annotation pipeline is standalone: opaque so the editor is hidden */
-  #apmodal{background:var(--bg);z-index:195;backdrop-filter:none;}
+  /* the auto-annotation pipeline is a standalone full-screen page (header bar +
+     centred form card), consistent with the Import / Class-count screens */
+  #apmodal{z-index:195;}
+  .ap-page{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start;padding:30px 20px;}
   .modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);width:360px;
          max-width:92vw;box-shadow:var(--sh-lg);}
   .modal-h{padding:15px 18px;font-size:15px;font-weight:600;border-bottom:1px solid var(--border);}
@@ -1849,6 +1851,8 @@ HTML = r"""<!DOCTYPE html>
   .bc-badge svg{flex:none;}
   .bc-badge.ok{background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.35);}
   .bc-badge.warn{background:rgba(251,191,36,.15);color:var(--warn);border:1px solid rgba(251,191,36,.38);}
+  .bc-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--warn);
+    margin-left:5px;box-shadow:0 0 0 2px rgba(251,191,36,.25);}
   .upd-banner{display:flex;align-items:center;gap:9px;margin-bottom:10px;padding:9px 11px;
     background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.4);border-radius:var(--r);}
   .upd-banner .upd-ic{flex:none;width:16px;height:16px;color:var(--warn);}
@@ -1911,6 +1915,7 @@ HTML = r"""<!DOCTYPE html>
 </div>
 <div id="topnav">
   <button id="homeBtn" onclick="goHome()" title="home"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/></svg></button>
+  <button id="tasksBtn" onclick="returnToTasks()" title="back to tasks" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></button>
   <span class="brand"><svg class="brand-logo" viewBox="0 0 64 64"><defs><linearGradient id="alg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6ea8fe"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect width="64" height="64" rx="15" fill="url(#alg1)"/><g stroke="#0a0a0a" stroke-width="3.4" stroke-linecap="round" fill="none" opacity=".88"><path d="M16 25v-7a2 2 0 0 1 2-2h7"/><path d="M48 25v-7a2 2 0 0 0-2-2h-7"/><path d="M16 39v7a2 2 0 0 0 2 2h7"/><path d="M48 39v7a2 2 0 0 1-2 2h-7"/></g><circle cx="32" cy="32" r="4.6" fill="#0a0a0a"/></svg>Annotation&nbsp;Studio</span>
   <span id="modebadge" class="mode local">Local</span>
   <button onclick="go(-1)" title="prev (A)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Prev</button>
@@ -2128,9 +2133,15 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div id="apmodal" class="modal-bg">
-  <div class="modal">
-    <div class="modal-h">Automatic annotations &rarr; CVAT</div>
+<div id="apmodal" class="browse">
+  <div class="browse-bar">
+    <button onclick="closeApModal()" title="home"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/></svg></button>
+    <span class="browse-title">Automatic annotations &rarr; CVAT</span>
+    <span class="spacer"></span>
+    <button onclick="loadApProjects(true)" title="refresh projects"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>Refresh</button>
+  </div>
+  <div class="ap-page">
+    <div class="modal">
     <div class="modal-body">
       <div id="apcfg">
         <label>Project</label>
@@ -2172,6 +2183,7 @@ HTML = r"""<!DOCTYPE html>
       <button id="apback" onclick="apShowConfig()" style="display:none;">Back</button>
       <button id="apnext" class="ok" onclick="apNext()">Next</button>
       <button id="aprun" class="ok" onclick="runAutoPipeline()" style="display:none;">Run</button>
+    </div>
     </div>
   </div>
 </div>
@@ -2492,6 +2504,7 @@ function applyMode(){
   // the project itself). CVAT mode also shows project select / import.
   document.getElementById('cvatsec').style.display='block';
   document.getElementById('cvatProjWrap').style.display = appMode==='cvat' ? 'block' : 'none';
+  const tb=document.getElementById('tasksBtn'); if(tb) tb.style.display = appMode==='cvat' ? '' : 'none';
   updateModeBadge();
 }
 function updateModeBadge(){
@@ -2953,7 +2966,7 @@ async function runImportClasses(){
   }catch(e){ msg.textContent='request failed'; }
 }
 // ---- CVAT upload modal + progress ----
-let cvatPoll=null;
+let cvatPoll=null, _lastUploadProj=null;
 function cvMsg(t){ const e=document.getElementById('cvmsg'); if(e) e.textContent=t||''; }
 function cvProgText(t){ const e=document.getElementById('cvprogtext'); if(e) e.textContent=t||''; }
 function cvIndet(on){
@@ -3030,12 +3043,14 @@ async function runCvatUpload(){
   let body;
   if(updating){
     body={task_id:linkedTask.task_id, classes};
+    _lastUploadProj = linkedTask.project_id;
   } else {
     const pid=document.getElementById('cvUploadProj').value;
     const tname=document.getElementById('cvattask').value.trim();
     if(!pid){ cvMsg('select a project to upload into'); return; }
     if(!tname){ cvMsg('enter a task name'); return; }
     body={project_id:pid, task_name:tname, classes};
+    _lastUploadProj = pid;
   }
   cvMsg(''); showCvProgress(); cvIndet(true);
   cvProgText(updating ? ('updating annotations on task #'+linkedTask.task_id+'…')
@@ -3060,9 +3075,13 @@ function pollCvatUpload(){
       clearInterval(cvatPoll);
       cvIndet(false);
       document.getElementById('cvcancel').textContent='Done';
-      if(s.error) cvProgText('failed: '+s.error);
-      else if(s.task_id) cvProgText('done ✓ — task '+s.task_id
-        +(s.task_url?' ('+s.task_url+')':''));
+      if(s.error){ cvProgText('failed: '+s.error); }
+      else {
+        cvProgText('done ✓'+(s.task_id?(' — task '+s.task_id):'')
+          +(s.task_url?' ('+s.task_url+')':'')+' — opening tasks…');
+        // hand the user back to the tasks page for that project
+        setTimeout(()=>{ closeCvModal(); returnToTasks(true, _lastUploadProj); }, 1100);
+      }
     }
   }, 1500);
 }
@@ -3078,15 +3097,34 @@ function bCard(id,name,sub,onclick,badge){
 const _ICO_CHECK='<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
 const _ICO_SYNC='<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/></svg>';
 function taskBadge(t){
-  // grid only signals whether a task is imported; "update available" is shown
-  // later, when the imported task is opened.
-  return t.imported ? '<span class="bc-badge ok">'+_ICO_CHECK+'imported</span>' : '';
+  // grid signals whether a task is imported; a small yellow dot beside it hints
+  // that a newer version exists on CVAT (full update prompt shows on open).
+  if(!t.imported) return '';
+  const dot = t.up_to_date===false ? '<span class="bc-dot" title="update available on CVAT"></span>' : '';
+  return '<span class="bc-badge ok">'+_ICO_CHECK+'imported'+dot+'</span>';
 }
 function openCvatBrowse(){
   document.getElementById('cvatbrowse').style.display='flex';
   browseProjects();
 }
 function closeCvatBrowse(){ document.getElementById('cvatbrowse').style.display='none'; }
+// jump back to the tasks grid for the current task's project (topnav button +
+// used after an upload). pidArg overrides which project's tasks to show.
+async function returnToTasks(refresh, pidArg){
+  const pid = pidArg || (linkedTask && linkedTask.project_id) || browseProjectId;
+  document.getElementById('cvatbrowse').style.display='flex';
+  if(!pid){ browseProjects(); return; }          // no project context -> project list
+  let pname = (String(browseProjectId)===String(pid) && browseProjectName) ? browseProjectName : '';
+  if(!pname){
+    let p=bProjects.find(x=>String(x.id)===String(pid));
+    if(!p){
+      try{ const r=await fetch('/api/cvat/projects?t='+Date.now()).then(r=>r.json());
+        if(r.projects) bProjects=r.projects; p=bProjects.find(x=>String(x.id)===String(pid)); }catch(e){}
+    }
+    pname = p ? p.name : ('#'+pid);
+  }
+  openProject(pid, pname, refresh);
+}
 async function browseProjects(refresh){
   browseState='projects';
   document.getElementById('browseBack').style.display='none';
