@@ -689,11 +689,12 @@ def _local_task_status(task_id, updated=None):
     Cheap (local filesystem only) — no CVAT calls."""
     dirs = _local_task_dirs(task_id)
     if not dirs:
-        return {"imported": False, "up_to_date": False}
+        return {"imported": False, "up_to_date": False, "local_path": None}
+    local_path = dirs[0]
     # Without a reference updated_date we can't judge freshness -> assume current
-    # (don't show a false "update available"); refreshing the list makes it exact.
+    # (don't show a false "update available"); checking on open makes it exact.
     if not updated:
-        return {"imported": True, "up_to_date": True}
+        return {"imported": True, "up_to_date": True, "local_path": local_path}
     up_to_date = False
     for d in dirs:
         try:
@@ -704,7 +705,7 @@ def _local_task_status(task_id, updated=None):
         if _norm_dt(link.get("updated_date")) == _norm_dt(updated):
             up_to_date = True
             break
-    return {"imported": True, "up_to_date": up_to_date}
+    return {"imported": True, "up_to_date": up_to_date, "local_path": local_path}
 
 
 def _annotate_imports(tasks):
@@ -947,10 +948,10 @@ def _cvat_import_task(task_id, status=None, force=False):
                 pass
 
 
-def _do_cvat_import(task_id):
+def _do_cvat_import(task_id, force=False):
     try:
         _set_imp(state="exporting", message="checking task…")
-        r = _cvat_import_task(task_id, status=lambda m: _set_imp(message=m))
+        r = _cvat_import_task(task_id, status=lambda m: _set_imp(message=m), force=force)
         msg = (f"already downloaded & up to date — {r['count']} images ✓"
                if r.get("cached")
                else f"downloaded {r['count']} images, {len(r['classes'])} classes ✓")
@@ -964,6 +965,7 @@ def _do_cvat_import(task_id):
 def api_cvat_import():
     data = request.get_json(force=True)
     task_id = data.get("task_id")
+    force = bool(data.get("force"))
     if not task_id:
         return jsonify({"error": "no task selected"}), 400
     if not (CVAT_URL and CVAT_USER and CVAT_PASS):
@@ -973,8 +975,29 @@ def api_cvat_import():
             return jsonify({"error": "an import is already running"}), 409
         _imp_job.update(running=True, state="starting", message="starting…",
                         path=None, count=0, error=None)
-    threading.Thread(target=_do_cvat_import, args=(task_id,), daemon=True).start()
+    threading.Thread(target=_do_cvat_import, args=(task_id,),
+                     kwargs={"force": force}, daemon=True).start()
     return jsonify({"started": True})
+
+
+@app.route("/api/cvat/taskstatus")
+def api_cvat_taskstatus():
+    """For an already-imported task: is the local copy still current with CVAT?
+    Makes a single lightweight CVAT call. Used when opening an imported task."""
+    tid = request.args.get("task_id")
+    if not tid:
+        return jsonify({"error": "no task id"}), 400
+    if not _local_task_dirs(tid):
+        return jsonify({"imported": False})
+    try:
+        session = _cvat_session()
+        info = session.get(f"{CVAT_URL}/api/tasks/{tid}").json()
+        updated = info.get("updated_date")
+    except Exception as e:
+        return jsonify({"imported": True, "up_to_date": None, "error": str(e)})
+    st = _local_task_status(tid, updated)
+    return jsonify({"imported": True, "up_to_date": st["up_to_date"],
+                    "updated_date": updated})
 
 
 @app.route("/api/cvat/importstatus")
@@ -1826,6 +1849,13 @@ HTML = r"""<!DOCTYPE html>
   .bc-badge svg{flex:none;}
   .bc-badge.ok{background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.35);}
   .bc-badge.warn{background:rgba(251,191,36,.15);color:var(--warn);border:1px solid rgba(251,191,36,.38);}
+  .upd-banner{display:flex;align-items:center;gap:9px;margin-bottom:10px;padding:9px 11px;
+    background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.4);border-radius:var(--r);}
+  .upd-banner .upd-ic{flex:none;width:16px;height:16px;color:var(--warn);}
+  .upd-banner .upd-text{flex:1;min-width:0;font-size:12px;color:var(--text);line-height:1.35;}
+  .upd-banner .upd-btn{flex:none;background:var(--warn);color:#1a1300;border:none;border-radius:6px;
+    padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;transition:filter .12s;}
+  .upd-banner .upd-btn:hover{filter:brightness(1.08);}
   .bcard:hover{transform:translateY(-3px);border-color:var(--accent);box-shadow:var(--sh-md);}
   .bcard .bc-id{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--ok);}
   .bcard .bc-name{font-size:15px;font-weight:600;color:var(--text);word-break:break-word;letter-spacing:-.2px;flex:1;}
@@ -1927,6 +1957,11 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="lp-sec" id="cvatsec">
       <h4>CVAT</h4>
+      <div id="cvupdatebanner" class="upd-banner" style="display:none">
+        <svg class="upd-ic" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/></svg>
+        <span class="upd-text" id="cvupdtext">A newer version of this task is available on CVAT.</span>
+        <button class="upd-btn" id="cvupdbtn" onclick="updateTaskNow()">Update</button>
+      </div>
       <div id="cvatProjWrap">
         <div class="lp-row">
           <select id="cvatproj" onchange="onCvatProjPick()"><option value="">— loading projects… —</option></select>
@@ -2491,6 +2526,7 @@ function continueLastSession(){
   hideAllScreens();
   if(img.complete && img.naturalWidth){ fit(); draw(); }
   else { load(typeof idx==='number'?idx:0); }
+  if(linkedTask && linkedTask.task_id) checkTaskUpdate(linkedTask.task_id);
 }
 // fill in the "continue last session" banner on the home page (if any)
 function showContinueCard(m){
@@ -2699,6 +2735,7 @@ async function loadFolder(){
   if(r.error){ setStatus('error: '+r.error); return; }
   count=r.count; classes=r.classes||[]; activeClass=0;
   linkedTask=r.linked_task||null;
+  hideUpdateBanner();
   buildClassUI();
   setStatus('loaded '+r.count+' images, '+classes.length+' classes from '+r.path);
   if(count) load(0); else { name=''; updateName(); }
@@ -3041,10 +3078,9 @@ function bCard(id,name,sub,onclick,badge){
 const _ICO_CHECK='<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
 const _ICO_SYNC='<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/></svg>';
 function taskBadge(t){
-  if(!t.imported) return '';
-  return t.up_to_date===false
-    ? '<span class="bc-badge warn">'+_ICO_SYNC+'update available</span>'
-    : '<span class="bc-badge ok">'+_ICO_CHECK+'imported</span>';
+  // grid only signals whether a task is imported; "update available" is shown
+  // later, when the imported task is opened.
+  return t.imported ? '<span class="bc-badge ok">'+_ICO_CHECK+'imported</span>' : '';
 }
 function openCvatBrowse(){
   document.getElementById('cvatbrowse').style.display='flex';
@@ -3080,23 +3116,78 @@ async function openProject(pid, pname, refresh){
     bTasks=r.tasks||[];
     grid.innerHTML = bTasks.length
       ? bTasks.map((t,i)=>{
-          const act=t.imported?(t.up_to_date===false?'update →':'open →'):'import →';
+          const act=t.imported?'open →':'import →';
           return bCard(t.id,t.name,(t.size!=null?t.size+' images · ':'')+act,'openTaskIdx('+i+')',taskBadge(t));
         }).join('')
       : '<div class="browse-empty">no tasks in this project</div>';
   }catch(e){ grid.innerHTML='<div class="browse-empty">failed to load tasks</div>'; }
 }
-function openTaskIdx(i){ const t=bTasks[i]; if(t) openTask(t.id, t.name); }
-async function openTask(tid, tname){
+function openTaskIdx(i){ const t=bTasks[i]; if(t) openTask(t); }
+async function openTask(t){
+  // already imported -> open the local copy right away (no re-download), then
+  // check CVAT in the background and offer an update if a newer version exists.
+  if(t.imported && t.local_path){
+    closeCvatBrowse();
+    appMode='cvat'; applyMode();
+    document.getElementById('folder').value=t.local_path;
+    await loadFolder();
+    setStatus('opened local copy of "'+t.name+'"');
+    checkTaskUpdate(t.id);
+    return;
+  }
+  // not imported yet -> download then open (progress overlay)
   document.getElementById('browseProg').style.display='flex';
-  document.getElementById('browseProgText').textContent='importing "'+tname+'"…';
+  document.getElementById('browseProgText').textContent='importing "'+t.name+'"…';
   try{
     const r=await fetch('/api/cvat/import',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({task_id:tid})}).then(r=>r.json());
+      body:JSON.stringify({task_id:t.id})}).then(r=>r.json());
     if(r.error){ document.getElementById('browseProgText').textContent='error: '+r.error; return; }
     browsePollImport();
   }catch(e){ document.getElementById('browseProgText').textContent='request failed'; }
+}
+// ---- "update available" banner for an opened imported task ----
+function hideUpdateBanner(){ const b=document.getElementById('cvupdatebanner'); if(b) b.style.display='none'; }
+function showUpdateBanner(tid){
+  const b=document.getElementById('cvupdatebanner'); if(!b) return;
+  b.dataset.tid=tid;
+  document.getElementById('cvupdtext').textContent='A newer version of this task is available on CVAT.';
+  document.getElementById('cvupdbtn').style.display='';
+  b.style.display='flex';
+}
+async function checkTaskUpdate(tid){
+  hideUpdateBanner();
+  if(!tid) return;
+  try{
+    const r=await fetch('/api/cvat/taskstatus?task_id='+tid+'&t='+Date.now()).then(r=>r.json());
+    if(r && r.imported && r.up_to_date===false) showUpdateBanner(tid);
+  }catch(e){}
+}
+async function updateTaskNow(){
+  const b=document.getElementById('cvupdatebanner'); const tid=b&&b.dataset.tid;
+  if(!tid) return;
+  document.getElementById('cvupdbtn').style.display='none';
+  document.getElementById('cvupdtext').textContent='Updating from CVAT…';
+  try{
+    const r=await fetch('/api/cvat/import',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task_id:tid, force:true})}).then(r=>r.json());
+    if(r.error){ document.getElementById('cvupdtext').textContent='update failed: '+r.error; return; }
+    clearInterval(impPoll);
+    impPoll=setInterval(async()=>{
+      let s; try{ s=await fetch('/api/cvat/importstatus?t='+Date.now()).then(r=>r.json()); }catch(e){ return; }
+      document.getElementById('cvupdtext').textContent=s.message||s.state||'updating…';
+      if(!s.running){
+        clearInterval(impPoll);
+        if(s.error){ document.getElementById('cvupdbtn').style.display=''; return; }
+        if(s.path){
+          hideUpdateBanner();
+          document.getElementById('folder').value=s.path;
+          await loadFolder();
+          setStatus('updated from CVAT ✓ — '+s.count+' images');
+        }
+      }
+    }, 1000);
+  }catch(e){ document.getElementById('cvupdtext').textContent='update request failed'; document.getElementById('cvupdbtn').style.display=''; }
 }
 function browsePollImport(){
   clearInterval(impPoll);
