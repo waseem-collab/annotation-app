@@ -818,6 +818,98 @@ def _extract_yolo_export(zip_path, out_dir):
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def _read_export_labels(zip_path):
+    """From an annotations-only YOLO export zip, return {image_stem: label_text}
+    for every .txt under obj_<subset>_data/, plus '__names__' -> obj.names list."""
+    import zipfile
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="cvat_lbl_")
+    out = {}
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmp)
+        for root, _, files in os.walk(tmp):
+            if "obj.names" in files:
+                with open(os.path.join(root, "obj.names"), encoding="utf-8") as fh:
+                    out["__names__"] = [ln.strip() for ln in fh if ln.strip()]
+                break
+        for root, _, files in os.walk(tmp):
+            parts = os.path.relpath(root, tmp).split(os.sep)
+            inside = any(p.lower().startswith("obj_") and p.lower().endswith("_data")
+                         for p in parts)
+            if not inside:
+                continue                       # skip train.txt / data.yaml at the root
+            for f in files:
+                if not f.lower().endswith(".txt"):
+                    continue
+                with open(os.path.join(root, f), encoding="utf-8") as fh:
+                    out[os.path.splitext(f)[0]] = fh.read()
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _update_labels_only(task_id, status=None):
+    """Refresh ONLY the label .txt files (and labels.txt) of an existing local
+    copy from CVAT — images are left untouched. Returns {out_dir, updated}.
+    `updated` is False when the local copy already matched CVAT (no download)."""
+    import tempfile
+    def say(m):
+        if status:
+            status(m)
+    dirs = _local_task_dirs(task_id)
+    if not dirs:
+        raise RuntimeError("task is not imported locally")
+    out_dir = dirs[0]
+    say("checking task…")
+    session = _cvat_session()
+    info = session.get(f"{CVAT_URL}/api/tasks/{task_id}").json()
+    updated = info.get("updated_date")
+    link_path = os.path.join(out_dir, ".cvat_task.json")
+    try:
+        with open(link_path, encoding="utf-8") as fh:
+            link = json.load(fh)
+    except (OSError, ValueError):
+        link = {}
+    if updated and _norm_dt(link.get("updated_date")) == _norm_dt(updated):
+        return {"out_dir": out_dir, "updated": False}        # already current
+    fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_lblexp_")
+    os.close(fd)
+    try:
+        say("downloading annotations…")
+        _cvat_export_task(session, task_id, zip_path, save_images=False)
+        say("writing labels…")
+        labels = _read_export_labels(zip_path)
+        names = labels.pop("__names__", None)
+        img_dir = os.path.join(out_dir, "images")
+        lbl_dir = os.path.join(out_dir, "labels")
+        os.makedirs(lbl_dir, exist_ok=True)
+        # rewrite every image's label to mirror CVAT exactly (handles removals)
+        for img in os.listdir(img_dir):
+            if os.path.splitext(img)[1].lower() not in (".jpg", ".jpeg", ".png"):
+                continue
+            stem = os.path.splitext(img)[0]
+            with open(os.path.join(lbl_dir, stem + ".txt"), "w", encoding="utf-8") as fh:
+                fh.write(labels.get(stem, ""))
+        if names:
+            with open(os.path.join(out_dir, "labels.txt"), "w", encoding="utf-8") as fh:
+                fh.write("\n".join(names) + "\n")
+        link["updated_date"] = updated                       # mark our copy current
+        try:
+            with open(link_path, "w", encoding="utf-8") as fh:
+                json.dump(link, fh)
+        except OSError:
+            pass
+        return {"out_dir": out_dir, "updated": True}
+    finally:
+        if os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+
 def _cvat_session():
     """Authenticated requests session (org-scoped). The REST export API is more
     reliable across server versions than the SDK's export_dataset()."""
@@ -839,12 +931,15 @@ def _cvat_session():
     return s
 
 
-def _cvat_export_task(session, task_id, zip_path):
-    """Export a task as 'YOLO 1.1' with images and download the zip."""
+def _cvat_export_task(session, task_id, zip_path, save_images=True):
+    """Export a task as 'YOLO 1.1' and download the zip. With save_images=False
+    only the annotation .txt files are exported (no images) — used for fast
+    labels-only refreshes."""
     import time
     # location=local is required for app.cvat.ai to populate result_url
     r = session.post(f"{CVAT_URL}/api/tasks/{task_id}/dataset/export",
-                     params={"format": "YOLO 1.1", "save_images": "true",
+                     params={"format": "YOLO 1.1",
+                             "save_images": "true" if save_images else "false",
                              "location": "local"})
     if r.status_code not in (200, 201, 202):
         raise RuntimeError(f"export init failed {r.status_code}: {r.text[:160]}")
@@ -948,9 +1043,18 @@ def _cvat_import_task(task_id, status=None, force=False):
                 pass
 
 
-def _do_cvat_import(task_id, force=False):
+def _do_cvat_import(task_id, force=False, labels_only=False):
     try:
         _set_imp(state="exporting", message="checking task…")
+        if labels_only:
+            # refresh annotations in place; keep the already-downloaded images
+            r = _update_labels_only(task_id, status=lambda m: _set_imp(message=m))
+            cnt = len([f for f in os.listdir(os.path.join(r["out_dir"], "images"))
+                       if os.path.splitext(f)[1].lower() in (".jpg", ".jpeg", ".png")])
+            msg = ("labels already up to date ✓" if not r.get("updated")
+                   else "labels updated from CVAT ✓ (images kept)")
+            _set_imp(running=False, state="done", path=r["out_dir"], count=cnt, message=msg)
+            return
         r = _cvat_import_task(task_id, status=lambda m: _set_imp(message=m), force=force)
         msg = (f"already downloaded & up to date — {r['count']} images ✓"
                if r.get("cached")
@@ -966,6 +1070,7 @@ def api_cvat_import():
     data = request.get_json(force=True)
     task_id = data.get("task_id")
     force = bool(data.get("force"))
+    labels_only = bool(data.get("labels_only"))
     if not task_id:
         return jsonify({"error": "no task selected"}), 400
     if not (CVAT_URL and CVAT_USER and CVAT_PASS):
@@ -976,7 +1081,8 @@ def api_cvat_import():
         _imp_job.update(running=True, state="starting", message="starting…",
                         path=None, count=0, error=None)
     threading.Thread(target=_do_cvat_import, args=(task_id,),
-                     kwargs={"force": force}, daemon=True).start()
+                     kwargs={"force": force, "labels_only": labels_only},
+                     daemon=True).start()
     return jsonify({"started": True})
 
 
@@ -1027,12 +1133,13 @@ def _do_update_all(task_ids):
         for i, tid in enumerate(task_ids, 1):
             _set_updall(done=i - 1, message=f"checking task {tid} ({i}/{total})…")
             try:
-                r = _cvat_import_task(
+                # labels-only: refresh annotations in place, never re-download images
+                r = _update_labels_only(
                     tid, status=lambda m: _set_updall(message=f"[{i}/{total}] {m}"))
-                if r.get("cached"):
-                    uptodate += 1
-                else:
+                if r.get("updated"):
                     updated += 1
+                else:
+                    uptodate += 1
             except Exception as e:
                 failed += 1
                 _set_updall(message=f"task {tid} failed: {e}")
@@ -3310,7 +3417,7 @@ async function updateTaskNow(){
   document.getElementById('cvupdtext').textContent='Updating from CVAT…';
   try{
     const r=await fetch('/api/cvat/import',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({task_id:tid, force:true})}).then(r=>r.json());
+      body:JSON.stringify({task_id:tid, labels_only:true})}).then(r=>r.json());
     if(r.error){ document.getElementById('cvupdtext').textContent='update failed: '+r.error; return; }
     clearInterval(impPoll);
     impPoll=setInterval(async()=>{
@@ -3323,7 +3430,7 @@ async function updateTaskNow(){
           hideUpdateBanner();
           document.getElementById('folder').value=s.path;
           await loadFolder();
-          setStatus('updated from CVAT ✓ — '+s.count+' images');
+          setStatus(s.message||'labels updated from CVAT ✓');
         }
       }
     }, 1000);
