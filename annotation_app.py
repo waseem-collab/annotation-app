@@ -1850,6 +1850,11 @@ HTML = r"""<!DOCTYPE html>
           font-size:12.5px;color:var(--text-muted);user-select:none;white-space:nowrap;
           transition:background .15s,border-color .15s,color .15s;}
   .toggle:hover{border-color:var(--border-2);}
+  .opacity-row{margin-top:10px;}
+  .opacity-row label{display:flex;justify-content:space-between;align-items:center;
+    font-size:12px;color:var(--text-muted);margin-bottom:6px;}
+  .opacity-row #fillopval{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums;}
+  .opacity-row input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer;height:5px;margin:0;}
   .toggle input{appearance:none;-webkit-appearance:none;width:0;height:0;margin:0;}
   .toggle:has(input:checked){background:var(--ok-soft);border-color:rgba(52,211,153,.4);color:var(--ok);}
   .toggle:has(input:checked)::before{content:'\25CF';color:var(--ok);font-size:9px;}
@@ -2200,6 +2205,10 @@ HTML = r"""<!DOCTYPE html>
       <div class="lp-toggles">
         <label class="toggle"><input type="checkbox" id="autosave" checked> &#10515; autosave</label>
       </div>
+      <div class="opacity-row">
+        <label for="fillop">Box fill opacity <span id="fillopval">10%</span></label>
+        <input type="range" id="fillop" min="0" max="60" step="5" value="10" oninput="setFillOpacity(this.value)">
+      </div>
     </div>
     <div class="lp-sec">
       <h4>Actions</h4>
@@ -2446,6 +2455,12 @@ function classFill(i,a){
   const hue = (i*47) % 360;
   return 'hsla('+hue+',70%,55%,'+a+')';
 }
+let fillOpacity=10;    // box-fill opacity in %, adjustable from the Tools slider (0 = off)
+function setFillOpacity(v){
+  fillOpacity=parseInt(v,10)||0;
+  const e=document.getElementById('fillopval'); if(e) e.textContent=fillOpacity+'%';
+  draw();              // apply immediately
+}
 function className(i){
   if(i>=0 && i<classes.length) return classes[i];
   return 'class '+i;
@@ -2676,8 +2691,9 @@ function draw(){
     if(hiddenClasses.has(b.cls)) return;    // class hidden by the visibility filter
     const p=toPix(b);
     const col = classColor(b.cls);          // box colour always matches its class
-    ctx.fillStyle = classFill(b.cls, i===sel?0.22:0.1);   // translucent same-colour fill
-    ctx.fillRect(p.x,p.y,p.w,p.h);
+    // translucent same-colour fill; selected box a bit stronger (Tools slider sets the base %)
+    const fa = (i===sel ? Math.min(fillOpacity*2,80) : fillOpacity)/100;
+    if(fa>0){ ctx.fillStyle = classFill(b.cls, fa); ctx.fillRect(p.x,p.y,p.w,p.h); }
     ctx.lineWidth = (i===sel)?3:1.5;         // selection shown by a thicker border + handles
     ctx.strokeStyle = col;
     ctx.strokeRect(p.x,p.y,p.w,p.h);
@@ -2933,8 +2949,8 @@ window.addEventListener('mousemove', e=>{
               w:Math.abs(m.x-drag.startX), h:Math.abs(m.y-drag.startY)};
     draw();
     ctx.save();
-    ctx.fillStyle=classFill(activeClass,0.1);
-    ctx.fillRect(drag.cur.x,drag.cur.y,drag.cur.w,drag.cur.h);
+    if(fillOpacity>0){ ctx.fillStyle=classFill(activeClass,fillOpacity/100);
+      ctx.fillRect(drag.cur.x,drag.cur.y,drag.cur.w,drag.cur.h); }
     ctx.strokeStyle=classColor(activeClass);
     ctx.lineWidth=1.5;
     ctx.strokeRect(drag.cur.x,drag.cur.y,drag.cur.w,drag.cur.h);
