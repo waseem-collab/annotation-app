@@ -1767,6 +1767,7 @@ HTML = r"""<!DOCTYPE html>
           cursor:pointer;font-size:13px;font-weight:500;white-space:nowrap;
           transition:background .15s,border-color .15s,color .15s;}
   #topnav button:hover{background:var(--surface-2);border-color:var(--border-2);}
+  #topnav button:disabled{opacity:.35;cursor:default;background:transparent;border-color:var(--border);}
   #topnav input[type=number]{width:74px;padding:7px 9px;background:var(--bg);color:var(--text);
           border:1px solid var(--border);border-radius:var(--r);outline:none;transition:border-color .15s,box-shadow .15s;}
   #topnav input[type=number]:focus{border-color:var(--accent);box-shadow:var(--ring);}
@@ -2164,6 +2165,8 @@ HTML = r"""<!DOCTYPE html>
   <span id="modebadge" class="mode local">Local</span>
   <button onclick="go(-1)" title="prev (A)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Prev</button>
   <button onclick="go(1)" title="next (D)">Next<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>
+  <button id="undoBtn" onclick="undo()" title="undo (Ctrl+Z)" disabled><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg></button>
+  <button id="redoBtn" onclick="redo()" title="redo (Ctrl+Y)" disabled><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9a5 5 0 0 0 0 10h3"/></svg></button>
   <input id="scrub" type="range" min="0" max="0" value="0"
          oninput="scrubTo(this.value)" onchange="scrubTo(this.value)"
          title="drag to scrub through all images">
@@ -2736,6 +2739,7 @@ async function load(i){
   // existing labels are always loaded as editable boxes
   boxes = origBoxes.map(b=>({...b}));
   touched=false; sel=-1; markDirty(false);
+  initHistory();                 // fresh undo/redo history for this image
   updateName();
   document.getElementById('jump').value = idx+1;
   img = new Image();
@@ -2832,12 +2836,12 @@ function renderPanel(){
 function selectBox(i){ sel=i; draw(); }
 function setCls(i, v){
   boxes[i].cls = parseInt(v,10) || 0;
-  touched=true; markDirty(true); draw(); maybeAutosave();
+  touched=true; markDirty(true); draw(); recordHistory(); maybeAutosave();
 }
 function removeBox(i){
   boxes.splice(i,1);
   if(sel===i) sel=-1; else if(sel>i) sel--;
-  touched=true; markDirty(true); draw(); maybeAutosave();
+  touched=true; markDirty(true); draw(); recordHistory(); maybeAutosave();
 }
 
 // ---- landing screen + mode ----
@@ -2974,7 +2978,7 @@ cv.addEventListener('mousedown', e=>{
       if(inside(toPix(boxes[i]),m)){
         boxes.splice(i,1);
         if(sel===i) sel=-1; else if(sel>i) sel--;
-        touched=true; markDirty(true); draw(); maybeAutosave();
+        touched=true; markDirty(true); draw(); recordHistory(); maybeAutosave();
         setStatus('deleted box #'+(i+1)+' (right-click)');
         return;
       }
@@ -3060,21 +3064,47 @@ window.addEventListener('mouseup', e=>{
     }
   }
   drag=null; draw();
+  recordHistory();          // one history entry per completed add / move / resize
   maybeAutosave();
 });
 
 function maybeAutosave(){
   if(document.getElementById('autosave').checked && touched) save();
 }
+
+// ---- undo / redo history (per image) ----
+let hist=[], histIdx=-1; const HIST_CAP=30;   // ~29 undo steps (well over 10)
+function _snap(){ return boxes.map(b=>({...b})); }
+function initHistory(){ hist=[_snap()]; histIdx=0; updateUndoButtons(); }
+function recordHistory(){
+  const snap=_snap();
+  if(histIdx>=0 && JSON.stringify(hist[histIdx])===JSON.stringify(snap)) return;  // no real change
+  hist=hist.slice(0,histIdx+1);        // drop any redo branch
+  hist.push(snap);
+  if(hist.length>HIST_CAP) hist.shift();
+  histIdx=hist.length-1;
+  updateUndoButtons();
+}
+function _applyHist(){
+  boxes=hist[histIdx].map(b=>({...b}));
+  sel=-1; touched=true; markDirty(true); draw(); maybeAutosave(); updateUndoButtons();
+}
+function undo(){ if(histIdx>0){ histIdx--; _applyHist(); setStatus('undo'); } }
+function redo(){ if(histIdx<hist.length-1){ histIdx++; _applyHist(); setStatus('redo'); } }
+function updateUndoButtons(){
+  const u=document.getElementById('undoBtn'), r=document.getElementById('redoBtn');
+  if(u) u.disabled = histIdx<=0;
+  if(r) r.disabled = histIdx>=hist.length-1;
+}
 function delSel(){
   if(sel<0){ setStatus('no box selected'); return; }
-  boxes.splice(sel,1); sel=-1; touched=true; markDirty(true); draw(); maybeAutosave();
+  boxes.splice(sel,1); sel=-1; touched=true; markDirty(true); draw(); recordHistory(); maybeAutosave();
 }
 async function clearAll(){
   if(!boxes.length) return;
   if(!(await appConfirm('Delete ALL boxes on this image?',
        {title:'Clear all', ok:'Delete all', danger:true}))) return;
-  boxes=[]; sel=-1; touched=true; markDirty(true); draw(); maybeAutosave();
+  boxes=[]; sel=-1; touched=true; markDirty(true); draw(); recordHistory(); maybeAutosave();
 }
 
 async function save(){
@@ -4152,6 +4182,11 @@ window.addEventListener('keydown', e=>{
     return;
   }
   if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT' || e.target.tagName==='TEXTAREA') return;
+  if(e.ctrlKey||e.metaKey){                       // undo / redo
+    const k=e.key.toLowerCase();
+    if(k==='z'){ e.preventDefault(); e.shiftKey?redo():undo(); return; }
+    if(k==='y'){ e.preventDefault(); redo(); return; }
+  }
   if(e.key==='c'||e.key==='C'){
     if(e.repeat) return;            // keep the wheel open while held
     if(!radial) openRadial();
