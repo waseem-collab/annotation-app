@@ -1709,21 +1709,44 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>annotation editor</title>
+<script>
+  // apply the saved theme before first paint (default: light); remembers last choice
+  (function(){ try{ document.documentElement.setAttribute('data-theme',
+    localStorage.getItem('theme')||'light'); }catch(e){ document.documentElement.setAttribute('data-theme','light'); } })();
+</script>
 <style>
   :root{
     --bg:#0a0a0a; --surface:#171717; --surface-2:#222; --surface-3:#1c1c1c;
     --border:#333; --border-2:#444;
     --text:#f5f5f5; --text-muted:#a3a3a3; --text-dim:#6f6f6f;
-    --accent:#6ea8fe; --accent-soft:rgba(110,168,254,.14);
+    --accent:#6ea8fe; --accent-soft:rgba(110,168,254,.14); --accent-fg:#0a0a0a; --accent-hover:#86b8ff;
     --ok:#34d399; --ok-soft:rgba(52,211,153,.14);
     --danger:#f87171; --danger-soft:rgba(248,113,113,.12); --danger-border:rgba(248,113,113,.32);
-    --warn:#fbbf24;
+    --warn:#fbbf24; --canvas-bg:#000;
     --r:8px; --r-lg:12px;
     --sh-sm:0 1px 2px rgba(0,0,0,.5);
     --sh-md:0 6px 18px rgba(0,0,0,.5);
     --sh-lg:0 18px 44px rgba(0,0,0,.6);
     --ring:0 0 0 3px rgba(110,168,254,.22);
   }
+  :root[data-theme="light"]{
+    --bg:#f7f7f8; --surface:#ffffff; --surface-2:#eef0f2; --surface-3:#f2f3f5;
+    --border:#e2e4e8; --border-2:#cfd2d8;
+    --text:#171717; --text-muted:#5b6470; --text-dim:#9aa0aa;
+    --accent:#2563eb; --accent-soft:rgba(37,99,235,.10); --accent-fg:#ffffff; --accent-hover:#1d4ed8;
+    --ok:#059669; --ok-soft:rgba(5,150,105,.12);
+    --danger:#dc2626; --danger-soft:rgba(220,38,38,.08); --danger-border:rgba(220,38,38,.30);
+    --warn:#b45309; --canvas-bg:#d7d9dd;
+    --sh-sm:0 1px 2px rgba(16,24,40,.06);
+    --sh-md:0 6px 18px rgba(16,24,40,.10);
+    --sh-lg:0 18px 44px rgba(16,24,40,.16);
+    --ring:0 0 0 3px rgba(37,99,235,.20);
+  }
+  .theme-btn{display:inline-flex;align-items:center;justify-content:center;}
+  .home-theme{position:absolute;top:18px;right:18px;z-index:5;width:40px;height:40px;
+    background:var(--surface);border:1px solid var(--border);color:var(--text-muted);
+    border-radius:var(--r);cursor:pointer;transition:background .15s,color .15s,border-color .15s;}
+  .home-theme:hover{background:var(--surface-2);color:var(--text);border-color:var(--border-2);}
   *{box-sizing:border-box;}
   html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
             font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -1766,7 +1789,7 @@ HTML = r"""<!DOCTYPE html>
                    box-shadow:0 0 0 1px rgba(0,0,0,.4);}
   #main{flex:1;display:flex;min-height:0;}
   #wrap{position:relative;flex:1;min-width:0;overflow:auto;display:flex;background:var(--bg);}
-  canvas#cv{background:#000;box-shadow:0 8px 40px rgba(0,0,0,.6);margin:auto;border-radius:2px;}
+  canvas#cv{background:var(--canvas-bg);box-shadow:0 8px 40px rgba(0,0,0,.6);margin:auto;border-radius:2px;}
   .dirty{color:var(--warn) !important;}
   kbd{background:var(--surface-2);border:1px solid var(--border-2);border-radius:5px;
       padding:1px 6px;font-size:11px;font-family:ui-monospace,Menlo,monospace;}
@@ -1798,8 +1821,8 @@ HTML = r"""<!DOCTYPE html>
   .lp-sec button.grow{flex:1;}
   .lp-sec button.danger{color:var(--danger);border-color:var(--danger-border);}
   .lp-sec button.danger:hover{background:var(--danger-soft);border-color:var(--danger);}
-  .lp-sec button.ok{background:var(--accent);color:#0a0a0a;border-color:var(--accent);font-weight:600;}
-  .lp-sec button.ok:hover{background:#86b8ff;border-color:#86b8ff;box-shadow:var(--ring);}
+  .lp-sec button.ok{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600;}
+  .lp-sec button.ok:hover{background:var(--accent-hover);border-color:var(--accent-hover);box-shadow:var(--ring);}
   .lp-sec select{width:100%;box-sizing:border-box;padding:8px 10px;background:var(--bg);
      color:var(--text);border:1px solid var(--border);border-radius:var(--r);font-size:13px;outline:none;
      transition:border-color .15s,box-shadow .15s;}
@@ -1945,8 +1968,8 @@ HTML = r"""<!DOCTYPE html>
                   background:transparent;color:var(--text);cursor:pointer;font-size:13px;font-weight:500;
                   transition:background .15s,border-color .15s;}
   .modal-f button:hover{background:var(--surface-2);border-color:var(--border-2);}
-  .modal-f button.ok{background:var(--accent);color:#0a0a0a;border-color:var(--accent);font-weight:600;}
-  .modal-f button.ok:hover{background:#86b8ff;}
+  .modal-f button.ok{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600;}
+  .modal-f button.ok:hover{background:var(--accent-hover);}
   .modal-f button:disabled{opacity:.45;cursor:default;}
   .bar{height:8px;background:var(--surface-2);border-radius:999px;overflow:hidden;margin:8px 0 12px;}
   .bar>div{height:100%;width:0;background:var(--accent);border-radius:999px;transition:width .3s ease;}
@@ -2094,6 +2117,7 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <div id="home">
+  <button class="theme-btn home-theme" onclick="toggleTheme()" title="toggle theme"></button>
   <div class="home-inner">
     <svg class="home-logo" viewBox="0 0 64 64"><defs><linearGradient id="alg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6ea8fe"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect width="64" height="64" rx="15" fill="url(#alg2)"/><g stroke="#0a0a0a" stroke-width="3.4" stroke-linecap="round" fill="none" opacity=".88"><path d="M16 25v-7a2 2 0 0 1 2-2h7"/><path d="M48 25v-7a2 2 0 0 0-2-2h-7"/><path d="M16 39v7a2 2 0 0 0 2 2h7"/><path d="M48 39v7a2 2 0 0 1-2 2h-7"/></g><circle cx="32" cy="32" r="4.6" fill="#0a0a0a"/></svg>
     <h1 class="home-title">Annotation Studio</h1>
@@ -2145,6 +2169,7 @@ HTML = r"""<!DOCTYPE html>
   <input id="jump" type="number" min="1" placeholder="#"
          onkeydown="if(event.key==='Enter')jump()">
   <button onclick="jump()">Go</button>
+  <button class="theme-btn" onclick="toggleTheme()" title="toggle theme"></button>
 </div>
 <div id="meta">
   <span id="name"></span>
@@ -2348,7 +2373,7 @@ HTML = r"""<!DOCTYPE html>
     <span class="spacer"></span>
     <select id="ccproj" style="width:auto;min-width:220px;max-width:340px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:13px;"><option value="">— select project —</option></select>
     <button onclick="ccLoadProjects(true)" title="refresh projects"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
-    <button class="ok" id="ccrun" onclick="ccRun()" style="background:var(--accent);color:#0a0a0a;border-color:var(--accent);font-weight:600;">Count</button>
+    <button class="ok" id="ccrun" onclick="ccRun()" style="background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600;">Count</button>
   </div>
   <div id="ccbody">
     <div id="ccempty" class="browse-empty">Select a CVAT project and click <b>Count</b>.</div>
@@ -2468,6 +2493,23 @@ function setFillOpacity(v){
   fillOpacity=parseInt(v,10)||0;
   const e=document.getElementById('fillopval'); if(e) e.textContent=fillOpacity+'%';
   draw();              // apply immediately
+}
+// ---- light / dark theme ----
+const _SUN='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
+const _MOON='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
+function currentTheme(){ return document.documentElement.getAttribute('data-theme')||'light'; }
+function updateThemeIcons(){
+  const dark=currentTheme()==='dark';
+  document.querySelectorAll('.theme-btn').forEach(b=>{
+    b.innerHTML = dark?_SUN:_MOON;      // moon in light (-> go dark), sun in dark (-> go light)
+    b.title = dark?'switch to light mode':'switch to dark mode';
+  });
+}
+function toggleTheme(){
+  const next = currentTheme()==='light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  try{ localStorage.setItem('theme', next); }catch(e){}   // remember the last choice
+  updateThemeIcons();
 }
 function className(i){
   if(i>=0 && i<classes.length) return classes[i];
@@ -2731,9 +2773,9 @@ function renderPanel(){
   let html='<div class="sec">Boxes on this image ('+shownN
     +(hiddenN?(' shown / '+boxes.length+' total'):'')+')</div>';
   if(!boxes.length){
-    html+='<div style="color:#777;padding:8px 10px;">none &mdash; draw a box</div>';
+    html+='<div style="color:var(--text-dim);padding:8px 10px;">none &mdash; draw a box</div>';
   } else if(!shownN){
-    html+='<div style="color:#777;padding:8px 10px;">all classes hidden</div>';
+    html+='<div style="color:var(--text-dim);padding:8px 10px;">all classes hidden</div>';
   } else {
     boxes.forEach((b,i)=>{
       if(hiddenClasses.has(b.cls)) return;
@@ -4093,6 +4135,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   buildClassUI();              // clamps + applies the restored active class
   updateNav();
   applyMode();                 // default to Local (CVAT section hidden until chosen)
+  updateThemeIcons();          // set the light/dark toggle icons
   showContinueCard(m);         // offer to resume the last session from the home page
   enhanceSelects(['classsel','cvatproj','aamode','apmodel',
                   'approj','apmode','cvUploadProj','ccproj','clsproj']);  // styled dropdowns
