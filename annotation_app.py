@@ -2440,6 +2440,12 @@ function classColor(i){
   const hue = (i*47) % 360;
   return 'hsl('+hue+',70%,55%)';
 }
+// same hue as the box outline, low alpha -> a translucent fill to tell boxes apart
+function classFill(i,a){
+  if(i<0) return 'rgba(136,136,136,'+a+')';
+  const hue = (i*47) % 360;
+  return 'hsla('+hue+',70%,55%,'+a+')';
+}
 function className(i){
   if(i>=0 && i<classes.length) return classes[i];
   return 'class '+i;
@@ -2670,6 +2676,8 @@ function draw(){
     if(hiddenClasses.has(b.cls)) return;    // class hidden by the visibility filter
     const p=toPix(b);
     const col = classColor(b.cls);          // box colour always matches its class
+    ctx.fillStyle = classFill(b.cls, i===sel?0.22:0.1);   // translucent same-colour fill
+    ctx.fillRect(p.x,p.y,p.w,p.h);
     ctx.lineWidth = (i===sel)?3:1.5;         // selection shown by a thicker border + handles
     ctx.strokeStyle = col;
     ctx.strokeRect(p.x,p.y,p.w,p.h);
@@ -2925,6 +2933,8 @@ window.addEventListener('mousemove', e=>{
               w:Math.abs(m.x-drag.startX), h:Math.abs(m.y-drag.startY)};
     draw();
     ctx.save();
+    ctx.fillStyle=classFill(activeClass,0.1);
+    ctx.fillRect(drag.cur.x,drag.cur.y,drag.cur.w,drag.cur.h);
     ctx.strokeStyle=classColor(activeClass);
     ctx.lineWidth=1.5;
     ctx.strokeRect(drag.cur.x,drag.cur.y,drag.cur.w,drag.cur.h);
