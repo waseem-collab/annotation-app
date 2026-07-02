@@ -613,7 +613,8 @@ def api_cvat_projectlabels():
             labels = list(proj.get_labels())
         labels.sort(key=lambda l: l.id)
         names = [l.name for l in labels]
-        return jsonify({"project_id": int(pid), "classes": names})
+        colors = [getattr(l, "color", "") or "" for l in labels]
+        return jsonify({"project_id": int(pid), "classes": names, "colors": colors})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2206,8 +2207,8 @@ HTML = r"""<!DOCTYPE html>
         <label class="toggle"><input type="checkbox" id="autosave" checked> &#10515; autosave</label>
       </div>
       <div class="opacity-row">
-        <label for="fillop">Box fill opacity <span id="fillopval">10%</span></label>
-        <input type="range" id="fillop" min="0" max="60" step="5" value="10" oninput="setFillOpacity(this.value)">
+        <label for="fillop">Box fill opacity <span id="fillopval">20%</span></label>
+        <input type="range" id="fillop" min="0" max="60" step="5" value="20" oninput="setFillOpacity(this.value)">
       </div>
     </div>
     <div class="lp-sec">
@@ -2444,18 +2445,25 @@ const HANDLE = 8;
 let drag = null;
 
 // distinct, evenly-spread palette; class id maps to a stable colour
+// CVAT's own label-colour palette (used when a class has no explicit CVAT colour)
+const CVAT_PALETTE=['#33ddff','#fa3253','#ff007c','#ff6037','#f3787e','#b83df5',
+  '#66ff66','#aaf0d1','#fafa37','#5986b3','#ff6a4d','#f078f0','#cc3366','#cc9933',
+  '#fa32b7','#ff355e','#8271d4','#20f1f1','#e1f93f','#34d1b7','#3399ff','#b25050'];
+let classColors=[];    // exact per-class CVAT colours when known, else the palette
 function classColor(i){
+  if(i>=0 && classColors[i]) return classColors[i];   // exact colour from CVAT
   if(i<0) return '#888';
-  const hue = (i*47) % 360;
-  return 'hsl('+hue+',70%,55%)';
+  return CVAT_PALETTE[i % CVAT_PALETTE.length];
 }
-// same hue as the box outline, low alpha -> a translucent fill to tell boxes apart
-function classFill(i,a){
-  if(i<0) return 'rgba(136,136,136,'+a+')';
-  const hue = (i*47) % 360;
-  return 'hsla('+hue+',70%,55%,'+a+')';
+function hexToRgba(hex,a){
+  hex=String(hex).replace('#','');
+  if(hex.length===3) hex=hex.split('').map(x=>x+x).join('');
+  const n=parseInt(hex,16)||0;
+  return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')';
 }
-let fillOpacity=10;    // box-fill opacity in %, adjustable from the Tools slider (0 = off)
+// same colour as the box outline, low alpha -> a translucent fill to tell boxes apart
+function classFill(i,a){ return hexToRgba(classColor(i), a); }
+let fillOpacity=20;    // box-fill opacity in %, adjustable from the Tools slider (0 = off)
 function setFillOpacity(v){
   fillOpacity=parseInt(v,10)||0;
   const e=document.getElementById('fillopval'); if(e) e.textContent=fillOpacity+'%';
@@ -3004,10 +3012,24 @@ async function loadFolder(){
   if(r.error){ setStatus('error: '+r.error); return; }
   count=r.count; classes=r.classes||[]; activeClass=0;
   linkedTask=r.linked_task||null;
+  classColors=[];                 // palette by default; exact CVAT colours below
   hideUpdateBanner();
   buildClassUI();
   setStatus('loaded '+r.count+' images, '+classes.length+' classes from '+r.path);
   if(count) load(0); else { name=''; updateName(); }
+  if(linkedTask && linkedTask.project_id) applyCvatColorsFor(linkedTask.project_id);
+}
+// pull a CVAT project's label colours and match them to this folder's classes by name
+async function applyCvatColorsFor(pid){
+  if(!pid) return;
+  try{
+    const r=await fetch('/api/cvat/projectlabels?project_id='+encodeURIComponent(pid)
+      +'&t='+Date.now()).then(r=>r.json());
+    if(r.error || !r.classes) return;
+    const map={}; r.classes.forEach((n,i)=>{ map[String(n).trim().toLowerCase()]=(r.colors||[])[i]||''; });
+    classColors = classes.map(n=>map[String(n).trim().toLowerCase()]||'');
+    buildClassUI(); draw();
+  }catch(e){}
 }
 
 // ---- automatic annotation (modal + progress) ----
@@ -3213,7 +3235,7 @@ async function fetchCvatClasses(){
       +'&t='+Date.now()).then(r=>r.json());
     if(r.error){ setCvatStatus('error: '+r.error); return; }
     if(!r.classes.length){ setCvatStatus('project '+pid+' has no labels'); return; }
-    classes=r.classes; activeClass=0; buildClassUI(); draw();   // recolour with new classes
+    classes=r.classes; classColors=r.colors||[]; activeClass=0; buildClassUI(); draw();   // recolour with CVAT's own colours
     persistClasses();
     setCvatStatus('using '+classes.length+' classes from CVAT project '+pid);
   }catch(e){ setCvatStatus('request failed'); }
@@ -3249,7 +3271,7 @@ async function runImportClasses(){
       +'&t='+Date.now()).then(r=>r.json());
     if(r.error){ msg.textContent='error: '+r.error; return; }
     if(!r.classes.length){ msg.textContent='project '+pid+' has no labels'; return; }
-    classes=r.classes; activeClass=0; buildClassUI(); draw();
+    classes=r.classes; classColors=r.colors||[]; activeClass=0; buildClassUI(); draw();
     persistClasses();
     setStatus('imported '+classes.length+' classes from CVAT project '+pid+' ✓');
     closeClsModal();
