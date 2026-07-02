@@ -1970,6 +1970,8 @@ HTML = r"""<!DOCTYPE html>
   .modal-f button:hover{background:var(--surface-2);border-color:var(--border-2);}
   .modal-f button.ok{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600;}
   .modal-f button.ok:hover{background:var(--accent-hover);}
+  .modal-f button.danger{background:var(--danger);color:#fff;border-color:var(--danger);font-weight:600;}
+  .modal-f button.danger:hover{filter:brightness(1.06);}
   .modal-f button:disabled{opacity:.45;cursor:default;}
   .bar{height:8px;background:var(--surface-2);border-radius:999px;overflow:hidden;margin:8px 0 12px;}
   .bar>div{height:100%;width:0;background:var(--accent);border-radius:999px;transition:width .3s ease;}
@@ -2441,6 +2443,19 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="confirmModal" class="modal-bg" style="z-index:400;">
+  <div class="modal" style="width:390px;">
+    <div class="modal-h" id="confirmTitle">Confirm</div>
+    <div class="modal-body">
+      <div id="confirmMsg" style="font-size:13.5px;color:var(--text);line-height:1.55;white-space:pre-line;"></div>
+    </div>
+    <div class="modal-f">
+      <button id="confirmCancel" onclick="_confirmResolve(false)">Cancel</button>
+      <button id="confirmOk" class="ok" onclick="_confirmResolve(true)">OK</button>
+    </div>
+  </div>
+</div>
+
 <div id="apwidget" class="apw" style="display:none;">
   <div class="apw-top">
     <span class="apw-dot"></span>
@@ -2511,6 +2526,27 @@ function toggleTheme(){
   try{ localStorage.setItem('theme', next); }catch(e){}   // remember the last choice
   updateThemeIcons();
 }
+// ---- in-app confirm dialog (replaces the browser's confirm popup) ----
+let _confirmCb=null;
+function appConfirm(message, opts){
+  opts=opts||{};
+  return new Promise(resolve=>{
+    _confirmCb=resolve;
+    document.getElementById('confirmMsg').textContent=message;
+    document.getElementById('confirmTitle').textContent=opts.title||'Confirm';
+    const ok=document.getElementById('confirmOk');
+    ok.textContent=opts.ok||'OK';
+    ok.classList.toggle('danger', !!opts.danger);
+    ok.classList.toggle('ok', !opts.danger);
+    document.getElementById('confirmModal').style.display='flex';
+    setTimeout(()=>{ try{ ok.focus(); }catch(e){} },0);
+  });
+}
+function _confirmResolve(v){
+  document.getElementById('confirmModal').style.display='none';
+  const cb=_confirmCb; _confirmCb=null; if(cb) cb(v);
+}
+function _confirmOpen(){ return document.getElementById('confirmModal').style.display==='flex'; }
 function className(i){
   if(i>=0 && i<classes.length) return classes[i];
   return 'class '+i;
@@ -2668,6 +2704,9 @@ function enhanceSelect(sel){
   function close(){ menu.style.display='none'; trg.classList.remove('open'); if(_ddCloseOpen===close)_ddCloseOpen=null; }
   function open(){ if(sel.disabled) return; if(_ddCloseOpen)_ddCloseOpen(); place(); menu.style.display='block'; trg.classList.add('open'); _ddCloseOpen=close;
     if(searchInp){ searchInp.value=''; applyFilter(''); setTimeout(()=>{try{searchInp.focus();}catch(e){}},0); } menu.scrollTop=0; }
+  // mousedown must not reach the document handler (it would close the menu a tick
+  // before the click toggles it, making an open menu immediately reopen)
+  trg.addEventListener('mousedown',e=>e.stopPropagation());
   trg.addEventListener('click',e=>{ e.stopPropagation(); (menu.style.display==='none')?open():close(); });
   menu.addEventListener('mousedown',e=>e.stopPropagation());
   new MutationObserver(rebuild).observe(sel,{childList:true,subtree:true});
@@ -2882,7 +2921,8 @@ async function deleteImage(){
   if(!count){ setStatus('no image to delete'); return; }
   const extra = (appMode==='cvat' && linkedTask)
     ? '\\nIt will also be removed from the CVAT task on the next update.' : '';
-  if(!confirm('Delete image "'+name+'" and its label from disk?\\nThis cannot be undone.'+extra)) return;
+  if(!(await appConfirm('Delete image "'+name+'" and its label from disk?\\nThis cannot be undone.'+extra,
+       {title:'Delete image', ok:'Delete', danger:true}))) return;
   const di=idx;
   touched=false; markDirty(false);     // don't autosave the image we're deleting
   try{
@@ -3030,9 +3070,10 @@ function delSel(){
   if(sel<0){ setStatus('no box selected'); return; }
   boxes.splice(sel,1); sel=-1; touched=true; markDirty(true); draw(); maybeAutosave();
 }
-function clearAll(){
+async function clearAll(){
   if(!boxes.length) return;
-  if(!confirm('Delete ALL boxes on this image?')) return;
+  if(!(await appConfirm('Delete ALL boxes on this image?',
+       {title:'Clear all', ok:'Delete all', danger:true}))) return;
   boxes=[]; sel=-1; touched=true; markDirty(true); draw(); maybeAutosave();
 }
 
@@ -3929,7 +3970,8 @@ function renderCcTable(res){
 async function saveIfDirty(){
   if(touched){
     if(document.getElementById('autosave').checked) await save();
-    else if(dirty && confirm('Unsaved changes — save before moving?')) await save();
+    else if(dirty && await appConfirm('Unsaved changes — save before moving?',
+            {title:'Unsaved changes', ok:'Save'})) await save();
   }
 }
 async function navTo(i){
@@ -4104,6 +4146,11 @@ function drawRadial(){
 }
 
 window.addEventListener('keydown', e=>{
+  if(_confirmOpen()){            // confirm dialog captures keys: Enter=OK, Esc=Cancel
+    if(e.key==='Enter'){ e.preventDefault(); _confirmResolve(true); }
+    else if(e.key==='Escape'){ e.preventDefault(); _confirmResolve(false); }
+    return;
+  }
   if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT' || e.target.tagName==='TEXTAREA') return;
   if(e.key==='c'||e.key==='C'){
     if(e.repeat) return;            // keep the wheel open while held
