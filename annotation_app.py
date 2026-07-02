@@ -1570,15 +1570,17 @@ def _set_aa(**kw):
         _aa_job.update(kw)
 
 
-def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf,
-                         mode, mapping):
+def _do_autoannotate_all(model_specs, images, img_dir, lbl_dir, classes, conf, mode):
+    """model_specs: list of (model_path, mapping) — each model's class-index ->
+    here class-index. All selected models run on every image; their detections
+    are pooled, then the mode (append/replace/skip) is applied once per image."""
     global CLASSES
     try:
-        model = _load_model(model_path)
-        names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
-        # if the folder has no classes, adopt the model's and persist labels.txt
-        if not classes:
-            classes = [names[k] for k in sorted(names)]
+        # if the folder has no classes, adopt the first model's and persist labels.txt
+        if not classes and model_specs:
+            m0 = _load_model(model_specs[0][0])
+            names0 = m0.names if isinstance(m0.names, dict) else dict(enumerate(m0.names))
+            classes = [names0[k] for k in sorted(names0)]
             data_dir = os.path.dirname(img_dir)
             try:
                 with open(os.path.join(data_dir, "labels.txt"), "w", encoding="utf-8") as fh:
@@ -1587,10 +1589,9 @@ def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf,
                     CLASSES = list(classes)
             except OSError:
                 pass
-        # mapping: model class index -> here class index. If absent, fall back to
-        # matching each detection's class name to the class list.
-        use_map = bool(mapping)
         name_to_idx = {str(n).strip().lower(): i for i, n in enumerate(classes)}
+        for mp, _ in model_specs:           # warm each model once up front
+            _load_model(mp)
         written = skipped = unmapped = added = 0
         for i, img in enumerate(images):
             _set_aa(done=i, message=f"annotating {i+1}/{len(images)}…")
@@ -1600,21 +1601,22 @@ def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf,
             if mode == "skip" and has_existing:
                 skipped += 1
                 continue
-            try:
-                dets, _ = _infer(model_path, os.path.join(img_dir, img), conf)
-            except Exception:
-                continue
             new_boxes = []
-            for d in dets:
-                if use_map:
-                    ci = mapping.get(d.get("cls_model"))
-                else:
-                    ci = name_to_idx.get(str(d["name"]).strip().lower())
-                if ci is None or not (0 <= ci < len(classes)):
-                    unmapped += 1
+            for mp, mapping in model_specs:            # pool detections from all models
+                try:
+                    dets, _ = _infer(mp, os.path.join(img_dir, img), conf)
+                except Exception:
                     continue
-                new_boxes.append({"cls": ci, "cx": d["cx"], "cy": d["cy"],
-                                  "w": d["w"], "h": d["h"]})
+                for d in dets:
+                    if mapping:
+                        ci = mapping.get(d.get("cls_model"))
+                    else:                              # no map -> match by class name
+                        ci = name_to_idx.get(str(d["name"]).strip().lower())
+                    if ci is None or not (0 <= ci < len(classes)):
+                        unmapped += 1
+                        continue
+                    new_boxes.append({"cls": ci, "cx": d["cx"], "cy": d["cy"],
+                                      "w": d["w"], "h": d["h"]})
             # append keeps the existing annotations and adds the detections
             boxes = (_read_label_file(lbl_path) + new_boxes) if mode == "append" else new_boxes
             _write_label_file(lbl_path, boxes)
@@ -1631,14 +1633,36 @@ def _do_autoannotate_all(model_path, images, img_dir, lbl_dir, classes, conf,
         _set_aa(running=False, state="error", error=str(e), message=f"failed: {e}")
 
 
+def _parse_mapping(raw):
+    m = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                m[int(k)] = int(v)
+            except (TypeError, ValueError):
+                pass
+    return m
+
+
 @app.route("/api/autoannotate_all", methods=["POST"])
 def api_autoannotate_all():
     data = request.get_json(force=True)
-    model_path = _safe_model_path(data.get("model", ""))
-    if not model_path:
-        return jsonify({"error": "invalid model"}), 400
     if not IMAGES:
         return jsonify({"error": "no images in the current folder"}), 400
+    # new multi-model form: models=[{model, mapping}]; also accept single model+mapping
+    model_specs = []
+    raw_models = data.get("models")
+    if isinstance(raw_models, list) and raw_models:
+        for m in raw_models:
+            mp = _safe_model_path((m or {}).get("model", ""))
+            if mp:
+                model_specs.append((mp, _parse_mapping((m or {}).get("mapping"))))
+    else:
+        mp = _safe_model_path(data.get("model", ""))
+        if mp:
+            model_specs.append((mp, _parse_mapping(data.get("mapping"))))
+    if not model_specs:
+        return jsonify({"error": "select at least one model"}), 400
     try:
         conf = float(data.get("conf", 0.25) or 0.25)
     except (TypeError, ValueError):
@@ -1649,23 +1673,15 @@ def api_autoannotate_all():
     mode = data.get("mode")
     if mode not in ("skip", "append", "replace"):
         mode = "append"
-    raw_map = data.get("mapping") or {}
-    mapping = {}
-    if isinstance(raw_map, dict):
-        for k, v in raw_map.items():
-            try:
-                mapping[int(k)] = int(v)
-            except (TypeError, ValueError):
-                pass
     with _aa_lock:
         if _aa_job["running"]:
             return jsonify({"error": "an auto-annotation run is already going"}), 409
         _aa_job.update(running=True, state="starting", done=0, total=len(IMAGES),
                        written=0, skipped=0, unmapped=0,
-                       message="loading model…", error=None)
-    args = (model_path, list(IMAGES), IMG_DIR, LBL_DIR, list(classes), conf, mode, mapping)
+                       message="loading models…", error=None)
+    args = (model_specs, list(IMAGES), IMG_DIR, LBL_DIR, list(classes), conf, mode)
     threading.Thread(target=_do_autoannotate_all, args=args, daemon=True).start()
-    return jsonify({"started": True, "count": len(IMAGES)})
+    return jsonify({"started": True, "count": len(IMAGES), "models": len(model_specs)})
 
 
 @app.route("/api/autoannotate_status")
@@ -1951,6 +1967,10 @@ HTML = r"""<!DOCTYPE html>
   .aptasks .tid{font-family:ui-monospace,Menlo,monospace;color:var(--ok);flex:none;}
   .aptasks .tname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .aptaskcount{font-size:11px;color:var(--accent);text-transform:none;letter-spacing:0;}
+  .aa-mgroup{margin-bottom:11px;}
+  .aa-mgroup:last-child{margin-bottom:0;}
+  .aa-mname{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;
+    color:var(--accent);margin:2px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--border);}
   .aprow{display:flex;gap:7px;align-items:center;margin:7px 0;}
   .aprow .spacer{flex:1;}
   .aprow button{flex:none;padding:7px 13px;background:transparent;color:var(--text);
@@ -2208,8 +2228,12 @@ HTML = r"""<!DOCTYPE html>
     <div class="modal-h">Automatic annotation</div>
     <div class="modal-body">
       <div id="aacfg">
-        <label>Model</label>
-        <select id="aamodel"><option value="">— loading models… —</option></select>
+        <label>Models <span class="aptaskcount" id="aamodelcount"></span></label>
+        <div id="aamodellist" class="aptasks"><div class="apt-empty">loading models…</div></div>
+        <div class="aprow">
+          <button type="button" onclick="aaSelectAllModels(true)">All</button>
+          <button type="button" onclick="aaSelectAllModels(false)">None</button>
+        </div>
         <label>Confidence</label>
         <input id="aaconf" type="number" min="0" max="1" step="0.05" value="0.25">
         <label>If a label already exists</label>
@@ -2976,7 +3000,18 @@ async function loadModelsInto(selId){
       +'</option>').join('');
   }catch(e){ sel.innerHTML='<option value="">— error —</option>'; }
 }
-async function loadModels(){ return loadModelsInto('aamodel'); }
+async function loadModels(){
+  const host=document.getElementById('aamodellist');
+  host.innerHTML='<div class="apt-empty">loading models…</div>';
+  try{
+    const r=await fetch('/api/models?t='+Date.now()).then(r=>r.json());
+    if(!r.models||!r.models.length){ host.innerHTML='<div class="apt-empty">no .pt models found</div>'; aaModelCount(); return; }
+    host.innerHTML=r.models.map(m=>'<label class="trow"><input type="checkbox" value="'+escapeHtml(m.path)
+      +'" data-name="'+escapeHtml(m.name)+'" onchange="aaModelCount()"><span class="tname">'
+      +escapeHtml(m.name)+'</span></label>').join('');
+    aaModelCount();
+  }catch(e){ host.innerHTML='<div class="apt-empty">error loading models</div>'; }
+}
 // three views: config -> map -> progress, with matching footer buttons
 function aaButtons(cancel,back,next,run){
   document.getElementById('aacancel').style.display=cancel?'':'none';
@@ -3004,21 +3039,36 @@ function showAaProgress(){
   document.getElementById('aacancel').textContent='Close';
   aaButtons(true,false,false,false);
 }
-let aaModelClasses=[];
+let aaModels=[];   // [{path,name,classes}] for each selected local model
+function aaModelCount(){
+  const n=document.querySelectorAll('#aamodellist input:checked').length;
+  const e=document.getElementById('aamodelcount'); if(e) e.textContent=n?('· '+n+' selected'):'';
+}
+function aaSelectAllModels(on){
+  document.querySelectorAll('#aamodellist input[type=checkbox]').forEach(c=>c.checked=on);
+  aaModelCount();
+}
+function aaCheckedModels(){
+  return [...document.querySelectorAll('#aamodellist input:checked')]
+    .map(c=>({path:c.value, name:c.getAttribute('data-name')||c.value}));
+}
 async function aaNext(){
-  const model=document.getElementById('aamodel').value;
-  if(!model){ setAaMsg('select a model'); return; }
+  const sel=aaCheckedModels();
+  if(!sel.length){ setAaMsg('select at least one model'); return; }
   setAaMsg('loading model classes…');
   try{
-    const r=await fetch('/api/modelclasses?model='+encodeURIComponent(model)
-      +'&t='+Date.now()).then(r=>r.json());
-    if(r.error){ setAaMsg('error: '+r.error); return; }
-    aaModelClasses=r.classes||[];
-    if(!aaModelClasses.length){ setAaMsg('model exposes no classes'); return; }
+    aaModels=[];
+    for(const m of sel){
+      const r=await fetch('/api/modelclasses?model='+encodeURIComponent(m.path)
+        +'&t='+Date.now()).then(r=>r.json());
+      if(r.error){ setAaMsg('error ('+m.name+'): '+r.error); return; }
+      aaModels.push({path:m.path, name:m.name, classes:r.classes||[]});
+    }
+    if(!aaModels.some(m=>m.classes.length)){ setAaMsg('selected models expose no classes'); return; }
     buildAaMap(); setAaMsg(''); aaShowMap();
   }catch(e){ setAaMsg('failed to load model classes'); }
 }
-// build the model-class -> here-class mapping rows (auto-match by name)
+// build per-model mapping groups: each model class -> a class here (auto-matched)
 function buildAaMap(){
   const host=document.getElementById('aamaplist');
   const names = classes.length ? classes : [];
@@ -3026,11 +3076,15 @@ function buildAaMap(){
   const opts=(selIdx)=>'<option value="">— skip —</option>'
     + names.map((n,i)=>'<option value="'+i+'"'+(i===selIdx?' selected':'')+'>'
         +i+': '+escapeHtml(n)+'</option>').join('');
-  host.innerHTML = aaModelClasses.map((mn,mi)=>{
-    const m=lower[String(mn).trim().toLowerCase()];
-    return '<div class="maprow"><span class="mc" title="'+escapeHtml(mn)+'">'+mi+': '
-      +escapeHtml(mn)+'</span><span class="arr">→</span>'
-      +'<select data-mi="'+mi+'">'+opts(m===undefined?-1:m)+'</select></div>';
+  host.innerHTML = aaModels.map(m=>{
+    const rows = m.classes.map((mn,mi)=>{
+      const idx=lower[String(mn).trim().toLowerCase()];
+      return '<div class="maprow"><span class="mc" title="'+escapeHtml(mn)+'">'+mi+': '
+        +escapeHtml(mn)+'</span><span class="arr">→</span>'
+        +'<select data-mi="'+mi+'">'+opts(idx===undefined?-1:idx)+'</select></div>';
+    }).join('');
+    return '<div class="aa-mgroup" data-model="'+escapeHtml(m.path)+'">'
+      +'<div class="aa-mname">'+escapeHtml(m.name)+'</div>'+rows+'</div>';
   }).join('');
   host.querySelectorAll('select').forEach(enhanceSelect);
 }
@@ -3046,21 +3100,25 @@ async function openAaModal(){
 function closeAaModal(){ document.getElementById('aamodal').style.display='none'; }
 let aaPoll=null;
 async function runAutoAnnotate(){
-  const model=document.getElementById('aamodel').value;
   const conf=parseFloat(document.getElementById('aaconf').value)||0.25;
   const mode=document.getElementById('aamode').value;
-  // gather the model-class -> here-class mapping from the dropdowns
-  const mapping={};
-  document.querySelectorAll('#aamaplist select').forEach(s=>{
-    if(s.value!=='') mapping[s.getAttribute('data-mi')]=parseInt(s.value,10);
+  // gather a per-model class mapping from each model's group of dropdowns
+  const models=[];
+  document.querySelectorAll('#aamaplist .aa-mgroup').forEach(g=>{
+    const mapping={};
+    g.querySelectorAll('select').forEach(s=>{
+      if(s.value!=='') mapping[s.getAttribute('data-mi')]=parseInt(s.value,10);
+    });
+    models.push({model:g.getAttribute('data-model'), mapping});
   });
-  if(!Object.keys(mapping).length){ setAaMsg('map at least one class (or all are set to skip)'); return; }
+  if(!models.length){ setAaMsg('select at least one model'); return; }
+  if(!models.some(m=>Object.keys(m.mapping).length)){ setAaMsg('map at least one class (or all are set to skip)'); return; }
   setAaMsg(''); showAaProgress();
-  setBar(0); aaProgText('starting… ('+count+' images)');
+  setBar(0); aaProgText('starting… ('+count+' images, '+models.length+' model'+(models.length>1?'s':'')+')');
   try{
     const r=await fetch('/api/autoannotate_all',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model, conf, mode, classes, mapping})}).then(r=>r.json());
+      body:JSON.stringify({models, conf, mode, classes})}).then(r=>r.json());
     if(r.error){ aaProgText('error: '+r.error); return; }
     pollAutoAnnotate();
   }catch(e){ aaProgText('request failed'); }
@@ -3988,7 +4046,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   updateNav();
   applyMode();                 // default to Local (CVAT section hidden until chosen)
   showContinueCard(m);         // offer to resume the last session from the home page
-  enhanceSelects(['classsel','cvatproj','aamodel','aatarget','aamode','apmodel',
+  enhanceSelects(['classsel','cvatproj','aamode','apmodel',
                   'approj','apmode','cvUploadProj','ccproj','clsproj']);  // styled dropdowns
   loadCvatProjects();          // populate the CVAT project dropdown in the background
   if(!count){ setStatus('no images in '+(m.path||'')+' — set a folder above'); return; }
