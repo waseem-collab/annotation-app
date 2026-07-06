@@ -2732,21 +2732,26 @@ function fromPix(x,y,w,h,cls){
            w:w/cv.width, h:h/cv.height };
 }
 
-async function load(i){
+async function load(i, opts){
+  opts=opts||{};
   if(i<0||i>=count) return;
   const r = await fetch('/api/item/'+i+'?t='+Date.now()).then(r=>r.json());
   idx=r.idx; name=r.name; count=r.count; origBoxes=r.boxes;
-  // existing labels are always loaded as editable boxes
-  boxes = origBoxes.map(b=>({...b}));
-  touched=false; sel=-1; markDirty(false);
-  initHistory();                 // fresh undo/redo history for this image
+  if(opts.boxes){                // restoring a history snapshot (undo/redo)
+    boxes = opts.boxes.map(b=>({...b})); touched=true; markDirty(true);
+  } else {                       // normal open: existing labels are editable boxes
+    boxes = origBoxes.map(b=>({...b})); touched=false; markDirty(false);
+  }
+  sel=-1;
+  noteBaseline();                // remember this image's opening state (global history is kept)
   updateName();
   document.getElementById('jump').value = idx+1;
   img = new Image();
   img.onload = ()=>{ fit(); draw(); };
   img.src = '/api/image/'+i+'?t='+Date.now();
-  setStatus('loaded');
+  setStatus(opts.boxes ? 'restored' : 'loaded');
   saveSession();
+  if(opts.boxes) maybeAutosave();
 }
 
 let zoom=1, baseW=0, baseH=0;
@@ -3072,25 +3077,35 @@ function maybeAutosave(){
   if(document.getElementById('autosave').checked && touched) save();
 }
 
-// ---- undo / redo history (per image) ----
-let hist=[], histIdx=-1; const HIST_CAP=30;   // ~29 undo steps (well over 10)
+// ---- undo / redo history (GLOBAL across images) ----
+// Each entry is {idx, boxes}. Undo/redo can cross image boundaries: it navigates
+// to the entry's image and restores that snapshot, so edits stay undoable even
+// after you move to another image.
+let hist=[], histIdx=-1; const HIST_CAP=40;   // plenty of steps across images
+let _loadBaseline=null;                        // boxes as this image was opened
 function _snap(){ return boxes.map(b=>({...b})); }
-function initHistory(){ hist=[_snap()]; histIdx=0; updateUndoButtons(); }
+function noteBaseline(){ _loadBaseline=_snap(); updateUndoButtons(); }
 function recordHistory(){
   const snap=_snap();
-  if(histIdx>=0 && JSON.stringify(hist[histIdx])===JSON.stringify(snap)) return;  // no real change
-  hist=hist.slice(0,histIdx+1);        // drop any redo branch
-  hist.push(snap);
-  if(hist.length>HIST_CAP) hist.shift();
+  const sameTop = histIdx>=0 && hist[histIdx].idx===idx;
+  const ref = sameTop ? hist[histIdx].boxes : _loadBaseline;
+  if(ref && JSON.stringify(ref)===JSON.stringify(snap)) return;   // nothing actually changed
+  hist=hist.slice(0,histIdx+1);                 // drop any redo branch
+  if(!sameTop && _loadBaseline)                 // first edit on this image -> keep its baseline
+    hist.push({idx, boxes:_loadBaseline});
+  hist.push({idx, boxes:snap});
+  while(hist.length>HIST_CAP) hist.shift();
   histIdx=hist.length-1;
   updateUndoButtons();
 }
-function _applyHist(){
-  boxes=hist[histIdx].map(b=>({...b}));
-  sel=-1; touched=true; markDirty(true); draw(); maybeAutosave(); updateUndoButtons();
+async function _applyHist(){
+  const st=hist[histIdx];
+  if(st.idx!==idx){ await load(st.idx, {boxes:st.boxes}); }   // jump to that image + restore
+  else { boxes=st.boxes.map(b=>({...b})); sel=-1; touched=true; markDirty(true); draw(); maybeAutosave(); }
+  updateUndoButtons();
 }
-function undo(){ if(histIdx>0){ histIdx--; _applyHist(); setStatus('undo'); } }
-function redo(){ if(histIdx<hist.length-1){ histIdx++; _applyHist(); setStatus('redo'); } }
+async function undo(){ if(histIdx>0){ histIdx--; await _applyHist(); setStatus('undo'); } }
+async function redo(){ if(histIdx<hist.length-1){ histIdx++; await _applyHist(); setStatus('redo'); } }
 function updateUndoButtons(){
   const u=document.getElementById('undoBtn'), r=document.getElementById('redoBtn');
   if(u) u.disabled = histIdx<=0;
