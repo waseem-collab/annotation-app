@@ -2015,7 +2015,8 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                               "map50": (sum_ap / n_present) if n_present else 0.0},
                   "images": n_images, "tasks": len(task_ids),
                   "conf": conf, "iou": iou_thr, "contain": bool(contain),
-                  "model": os.path.basename(model_path), "project_id": project_id}
+                  "model": (config or {}).get("model_name") or os.path.basename(model_path),
+                  "model_file": os.path.basename(model_path), "project_id": project_id}
         import time
         finished_at = time.strftime("%Y-%m-%d %H:%M")
         run_id = str(int(time.time() * 1000))
@@ -2037,12 +2038,17 @@ def api_val_upload_model():
         return jsonify({"error": "no file"}), 400
     if not f.filename.lower().endswith(".pt"):
         return jsonify({"error": "not a .pt file"}), 400
+    import time
     os.makedirs(UPLOAD_MODELS_DIR, exist_ok=True)
-    safe = _safe_name(os.path.splitext(os.path.basename(f.filename))[0]) + ".pt"
-    dest = os.path.join(UPLOAD_MODELS_DIR, safe)
+    orig = os.path.basename(f.filename)                       # what the user dropped
+    stem = _safe_name(os.path.splitext(orig)[0])
+    # store under a unique name — every YOLO run spits out "best.pt", so without
+    # this a second upload would silently clobber the model an older run used.
+    stored = f"{stem}_{time.strftime('%Y%m%d-%H%M%S')}.pt"
+    dest = os.path.join(UPLOAD_MODELS_DIR, stored)
     f.save(dest)
     rel = os.path.relpath(dest, MODELS_DIR)
-    return jsonify({"ok": True, "path": rel, "name": safe,
+    return jsonify({"ok": True, "path": rel, "name": orig, "file": stored,
                     "size": os.path.getsize(dest)})
 
 
@@ -2104,8 +2110,10 @@ def api_val_run():
     if not mapping:
         return jsonify({"error": "map at least one model class"}), 400
     contain = bool(data.get("contain", True))     # containment counts as a match
-    # everything needed to reproduce/pre-fill this run next time
-    config = {"model": data.get("model"), "model_name": os.path.basename(model_path),
+    # the name the user dropped (display) vs the unique file we stored it as
+    display = (data.get("model_name") or "").strip() or os.path.basename(model_path)
+    config = {"model": data.get("model"), "model_name": display,
+              "model_file": os.path.basename(model_path),
               "project_id": project_id, "task_ids": task_ids, "classes": list(classes),
               "conf": conf, "iou": iou_thr, "contain": contain,
               "mapping": {str(k): v for k, v in mapping.items()}}
@@ -2142,6 +2150,7 @@ def api_val_history():
             acc = tp / (tp + fp + fn) if (tp + fp + fn) else 0.0
         out.append({"id": h.get("id"), "finished_at": h.get("finished_at"),
                     "model": r.get("model") or c.get("model_name"),
+                    "model_file": r.get("model_file") or c.get("model_file") or "",
                     "project_id": r.get("project_id"), "tasks": r.get("tasks"),
                     "images": r.get("images"), "conf": r.get("conf"), "iou": r.get("iou"),
                     "map50": o.get("map50"), "precision": o.get("precision"),
@@ -4784,8 +4793,9 @@ async function enterVal(){
 // restore the previous run's model / project / tasks / thresholds into the form
 async function valPrefill(cfg){
   try{
-    valModel={path:cfg.model, name:cfg.model_name};
-    valModelChip(cfg.model_name, 'last used');
+    // NOTE: the model is deliberately NOT restored — you drop a fresh .pt each run,
+    // so a run can never be silently attributed to the previous model.
+    valClearModel();
     if(cfg.conf!=null) document.getElementById('valconf').value=cfg.conf;
     if(cfg.iou!=null) document.getElementById('valiou').value=cfg.iou;
     if(cfg.contain!=null) document.getElementById('valcontain').checked=!!cfg.contain;
@@ -4934,7 +4944,7 @@ async function valShowHistory(){
   runs.forEach(r=>{
     h+='<tr class="histrow" onclick="valOpenRun(\''+r.id+'\')">'
       +'<td>'+escapeHtml(r.finished_at||'')+'</td>'
-      +'<td>'+escapeHtml(r.model||'')+'</td>'
+      +'<td title="'+escapeHtml(r.model_file||r.model||'')+'">'+escapeHtml(r.model||'')+'</td>'
       +'<td>'+escapeHtml(String(r.project_id||''))+'</td>'
       +'<td>'+(r.tasks||0)+'</td><td>'+(r.images||0)+'</td>'
       +'<td class="dim">'+r.conf+' / '+r.iou+'</td>'
@@ -5008,7 +5018,7 @@ async function valPickFile(f){
   try{
     const r=await fetch('/api/val/upload_model',{method:'POST',body:fd}).then(r=>r.json());
     if(r.error){ valMsg('upload failed: '+r.error); return; }
-    valModel={path:r.path, name:r.name};
+    valModel={path:r.path, name:r.name, file:r.file};
     valModelChip(r.name, (r.size/1048576).toFixed(1)+' MB');
     valMsg('');
   }catch(e){ valMsg('upload failed'); }
@@ -5096,7 +5106,8 @@ async function runValidation(){
     if(s.value!=='') mapping[s.getAttribute('data-mi')]=parseInt(s.value,10);
   });
   if(!Object.keys(mapping).length){ valMsg('map at least one class','valmsg2'); return; }
-  const body={ model:valModel.path, project_id:document.getElementById('valproj').value,
+  const body={ model:valModel.path, model_name:valModel.name,
+    project_id:document.getElementById('valproj').value,
     task_ids:valCheckedTasks(), classes:valGtClasses, mapping,
     conf:parseFloat(document.getElementById('valconf').value)||0.4,
     iou:parseFloat(document.getElementById('valiou').value)||0.5,
