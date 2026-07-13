@@ -2279,6 +2279,29 @@ HTML = r"""<!DOCTYPE html>
   .val-tile .vt-v{font-size:22px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;}
   .val-tile.hero .vt-v{color:var(--accent);}
   .val-sub{font-size:12.5px;color:var(--text-muted);margin-bottom:14px;}
+  .val-verdict{padding:11px 14px;border-radius:var(--r);font-size:13.5px;font-weight:600;
+    margin-bottom:14px;border:1px solid;}
+  .val-verdict.ok{background:var(--ok-soft);color:var(--ok);border-color:rgba(52,211,153,.35);}
+  .val-verdict.warn{background:rgba(251,191,36,.12);color:var(--warn);border-color:rgba(251,191,36,.38);}
+  .val-verdict.bad{background:var(--danger-soft);color:var(--danger);border-color:var(--danger-border);}
+  .val-ins{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;}
+  @media(max-width:900px){.val-ins{grid-template-columns:1fr;}}
+  .ins-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);
+    padding:14px 16px;box-shadow:var(--sh-sm);}
+  .ins-card .ins-h{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:700;
+    text-transform:uppercase;letter-spacing:.5px;margin-bottom:9px;}
+  .ins-card.good .ins-h{color:var(--ok);}
+  .ins-card.bad .ins-h{color:var(--danger);}
+  .ins-card ul{margin:0;padding-left:17px;}
+  .ins-card li{font-size:12.5px;color:var(--text);line-height:1.55;margin-bottom:7px;}
+  .ins-card li:last-child{margin-bottom:0;}
+  .ins-card li b{font-weight:700;}
+  .ins-none{font-size:12.5px;color:var(--text-muted);}
+  .ins-notes{background:var(--surface-3);border:1px solid var(--border);border-radius:var(--r-lg);
+    padding:12px 16px;margin-bottom:18px;}
+  .ins-notes ul{margin:0;padding-left:17px;}
+  .ins-notes li{font-size:12.5px;color:var(--text-muted);line-height:1.55;margin-bottom:6px;}
+  .ins-notes li:last-child{margin-bottom:0;}
   table.valtab{width:100%;border-collapse:collapse;font-size:12.5px;background:var(--surface);
     border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;}
   table.valtab th{background:var(--surface-2);color:var(--text-muted);font-size:10.5px;font-weight:700;
@@ -4649,6 +4672,69 @@ function pollValidation(){
   }, 1000);
 }
 function pct(x){ return (x*100).toFixed(1)+'%'; }
+// Turn the raw metrics into plain-language findings: what's solid, what needs work.
+function valInsights(res){
+  const o=res.overall||{}, cls=res.per_class||[];
+  const scored=cls.filter(c=>c.gt>0);            // classes the ground truth actually has
+  const good=[], bad=[], notes=[];
+  const m=o.map50||0;
+  let verdict, vclass;
+  if(m>=0.5){ vclass='ok'; verdict='Strong overall — mAP@50 '+m.toFixed(3)+'. This model holds up well on this dataset.'; }
+  else if(m>=0.25){ vclass='warn'; verdict='Mixed — mAP@50 '+m.toFixed(3)+'. Some classes are usable, several need work.'; }
+  else { vclass='bad'; verdict='Weak overall — mAP@50 '+m.toFixed(3)+'. This model is poorly matched to this dataset.'; }
+
+  // ---- what's working (ranked by AP; only the top one is "the strongest")
+  let first=true;
+  scored.slice().sort((a,b)=>b.ap50-a.ap50).forEach(c=>{
+    if(c.gt>=5 && c.ap50>=0.40){
+      good.push('<b>'+escapeHtml(c.name)+'</b> — '+(first?'its strongest class':'a solid performer')
+        +': AP@50 '+c.ap50.toFixed(3)+', finds '+pct(c.recall)+' of '+c.gt
+        +' objects at '+pct(c.precision)+' precision.');
+      first=false;
+    } else if(c.gt>=5 && c.precision>=0.85 && c.tp>0 && c.recall>=0.3){
+      // (skip when recall is poor — that class is already called out as a problem)
+      good.push('<b>'+escapeHtml(c.name)+'</b> — very precise: '+pct(c.precision)
+        +' of its detections are correct, so it rarely raises a false alarm.');
+    }
+  });
+  if(o.precision>=0.8) good.push('Overall precision is high ('+pct(o.precision)+') — when it fires, it is usually right.');
+  if(o.recall>=0.8) good.push('Overall recall is high ('+pct(o.recall)+') — it finds most of the objects.');
+
+  // ---- what needs improvement
+  scored.forEach(c=>{
+    if(c.gt>=5 && c.recall<0.3)
+      bad.push('<b>'+escapeHtml(c.name)+'</b> — misses most of them: recall '+pct(c.recall)
+        +' ('+c.fn+' of '+c.gt+' not found). Needs more training data or a lower threshold.');
+    if(c.gt>=5 && c.precision<0.5 && (c.tp+c.fp)>=5)
+      bad.push('<b>'+escapeHtml(c.name)+'</b> — noisy: only '+pct(c.precision)+' precision with '
+        +c.fp+' false alarms. It is over-triggering.');
+    if(c.tp===0 && c.fp===0)
+      bad.push('<b>'+escapeHtml(c.name)+'</b> — never detected once, though the ground truth has '
+        +c.gt+'. The model likely has no equivalent class, or it is left unmapped.');
+  });
+  cls.filter(c=>c.gt===0 && c.fp>0).sort((a,b)=>b.fp-a.fp).forEach(c=>{
+    bad.push('<b>'+escapeHtml(c.name)+'</b> — predicted '+c.fp+' times but the ground truth has <b>none</b>. '
+      +'Pure false positives dragging precision down — consider un-mapping this class.');
+  });
+
+  // ---- tuning notes
+  if(o.precision>0 && o.recall>0){
+    if(o.precision-o.recall>0.15)
+      notes.push('Precision ('+pct(o.precision)+') far exceeds recall ('+pct(o.recall)
+        +') — the model is too cautious and is skipping objects. Try <b>lowering the confidence</b> threshold.');
+    else if(o.recall-o.precision>0.15)
+      notes.push('Recall ('+pct(o.recall)+') exceeds precision ('+pct(o.precision)
+        +') — it detects a lot but much of it is wrong. Try <b>raising the confidence</b> threshold.');
+  }
+  const tiny=scored.filter(c=>c.gt<5);
+  if(tiny.length)
+    notes.push(tiny.length+' class(es) have fewer than 5 ground-truth objects ('
+      +tiny.map(c=>escapeHtml(c.name)).join(', ')+') — too few samples to judge reliably; their scores are noise.');
+  const unseen=cls.filter(c=>c.gt===0 && c.fp===0).length;
+  if(unseen) notes.push(unseen+' class(es) have no ground truth here and were never predicted — they simply do not apply to this dataset.');
+
+  return {verdict, vclass, good:good.slice(0,5), bad:bad.slice(0,6), notes};
+}
 function renderValResult(res, finishedAt){
   const o=res.overall||{};
   let h='<div class="val-tiles">'
@@ -4664,6 +4750,25 @@ function renderValResult(res, finishedAt){
     +' &nbsp;·&nbsp; '+(res.tasks||0)+' task(s) &nbsp;·&nbsp; conf &ge; '+res.conf+' &nbsp;·&nbsp; IoU &ge; '+res.iou
     +(finishedAt?(' &nbsp;·&nbsp; <b>last run '+escapeHtml(finishedAt)+'</b>'):'')
     +' &nbsp;·&nbsp; ground truth was only read, never modified</div>';
+
+  // ---- automatic read of the results
+  const ins=valInsights(res);
+  h+='<div class="val-verdict '+ins.vclass+'">'+ins.verdict+'</div>';
+  h+='<div class="val-ins">';
+  h+='<div class="ins-card good"><div class="ins-h">'
+    +'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Working well</div>'
+    +(ins.good.length ? '<ul>'+ins.good.map(t=>'<li>'+t+'</li>').join('')+'</ul>'
+                      : '<div class="ins-none">Nothing stands out as solid yet — no class clears the bar.</div>')
+    +'</div>';
+  h+='<div class="ins-card bad"><div class="ins-h">'
+    +'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>Needs improvement</div>'
+    +(ins.bad.length ? '<ul>'+ins.bad.map(t=>'<li>'+t+'</li>').join('')+'</ul>'
+                     : '<div class="ins-none">No glaring weaknesses — nice.</div>')
+    +'</div>';
+  h+='</div>';
+  if(ins.notes.length)
+    h+='<div class="ins-notes"><ul>'+ins.notes.map(t=>'<li>'+t+'</li>').join('')+'</ul></div>';
+
   h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th><th>TP</th><th>FP</th><th>FN</th>'
     +'<th>Precision</th><th>Recall</th><th>F1</th><th>AP@50</th></tr></thead><tbody>';
   (res.per_class||[]).forEach(c=>{
