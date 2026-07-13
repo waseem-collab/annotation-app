@@ -1790,6 +1790,23 @@ def _contained(a, b, frac=0.95):
     return smaller > 0 and (inter / smaller) >= frac
 
 
+DEDUP_IOU = 0.7          # same default ultralytics uses for NMS
+
+
+def _nms(preds, thr=DEDUP_IOU):
+    """Drop duplicate boxes of the same class (greedy, highest confidence first).
+    End-to-end / NMS-free models can emit stacked boxes on one object; this is the
+    de-duplication pass they would normally get at deployment."""
+    out = []
+    for ci in {p["cls"] for p in preds}:
+        keep = []
+        for p in sorted([x for x in preds if x["cls"] == ci], key=lambda x: -x["conf"]):
+            if all(_iou(p, k) < thr for k in keep):
+                keep.append(p)
+        out.extend(keep)
+    return out
+
+
 def _average_precision(dets, n_gt):
     """AP from detections [(conf, is_tp)] using all-point interpolation."""
     if n_gt == 0 or not dets:
@@ -1944,7 +1961,7 @@ def _prepare_gt(task_ids, classes, say=None):
     return items
 
 
-def _assemble_metrics(classes, gt_count, tp, fp, det_pool):
+def _assemble_metrics(classes, gt_count, tp, fp, det_pool, fp_dup=None, fp_bg=None):
     per_class, sum_ap, n_present = [], 0.0, 0
     for ci in range(len(classes)):
         fn = max(0, gt_count[ci] - tp[ci])
@@ -1957,8 +1974,11 @@ def _assemble_metrics(classes, gt_count, tp, fp, det_pool):
         if gt_count[ci]:
             sum_ap += ap
             n_present += 1
+        d = (fp_dup[ci] if fp_dup else 0)
+        bgd = (fp_bg[ci] if fp_bg else fp[ci])
         per_class.append({"name": classes[ci], "gt": gt_count[ci], "tp": tp[ci],
-                          "fp": fp[ci], "fn": fn, "precision": prec, "recall": rec,
+                          "fp": fp[ci], "fp_dup": d, "fp_bg": bgd, "fn": fn,
+                          "precision": prec, "recall": rec,
                           "f1": f1, "accuracy": acc, "ap50": ap})
     TP, FP = sum(tp), sum(fp)
     GT = sum(gt_count)
@@ -1967,13 +1987,19 @@ def _assemble_metrics(classes, gt_count, tp, fp, det_pool):
     R = TP / GT if GT else 0.0
     F1 = (2 * P * R / (P + R)) if (P + R) else 0.0
     ACC = TP / (TP + FP + FN) if (TP + FP + FN) else 0.0
+    DUP = sum(fp_dup) if fp_dup else 0
+    BG = sum(fp_bg) if fp_bg else FP
+    # what precision would be if the duplicates were merged away (i.e. with NMS)
+    P_nodup = TP / (TP + BG) if (TP + BG) else 0.0
     return {"classes": classes, "per_class": per_class,
-            "overall": {"gt": GT, "tp": TP, "fp": FP, "fn": FN, "precision": P,
+            "overall": {"gt": GT, "tp": TP, "fp": FP, "fp_dup": DUP, "fp_bg": BG,
+                        "fn": FN, "precision": P, "precision_nodup": P_nodup,
                         "recall": R, "f1": F1, "accuracy": ACC,
                         "map50": (sum_ap / n_present) if n_present else 0.0}}
 
 
-def _score_model(model_path, mapping, items, classes, conf, iou_thr, contain, tick=None):
+def _score_model(model_path, mapping, items, classes, conf, iou_thr, contain,
+                 dedup=False, tick=None):
     """Run ONE model over the prepared ground truth.
     Returns (metrics, per_image, ms_per_image). per_image[i] lines up with items[i]."""
     import time
@@ -1981,6 +2007,8 @@ def _score_model(model_path, mapping, items, classes, conf, iou_thr, contain, ti
     gt_count = [0] * n_cls
     tp = [0] * n_cls
     fp = [0] * n_cls
+    fp_dup = [0] * n_cls          # FP that sits on a GT already claimed -> a duplicate box
+    fp_bg = [0] * n_cls           # FP that matches no GT at all -> a genuine hallucination
     det_pool = [[] for _ in range(n_cls)]
     per_image = []
     _load_model(model_path)
@@ -2008,21 +2036,26 @@ def _score_model(model_path, mapping, items, classes, conf, iou_thr, contain, ti
                 continue
             preds.append({"cls": ci, "conf": dt["conf"], "cx": dt["cx"],
                           "cy": dt["cy"], "w": dt["w"], "h": dt["h"]})
+        if dedup:
+            preds = _nms(preds)          # merge stacked boxes before scoring
         for ci in range(n_cls):
             g = [x for x in gts if x["cls"] == ci]
             p = sorted([x for x in preds if x["cls"] == ci], key=lambda x: -x["conf"])
             used = [False] * len(g)
             for pr in p:
-                best, best_j = -1.0, -1
+                best, best_j, dup_hit = -1.0, -1, False
                 for j, gb in enumerate(g):
-                    if used[j]:
-                        continue
                     v = _iou(pr, gb)
                     ok = v >= iou_thr or (contain and _contained(pr, gb))
-                    if ok and v > best:
+                    if not ok:
+                        continue
+                    if used[j]:
+                        dup_hit = True       # it IS on an object — just one already claimed
+                    elif v > best:
                         best, best_j = v, j
                 is_tp = best_j >= 0
                 pr["tp"] = bool(is_tp)
+                pr["dup"] = bool(not is_tp and dup_hit)
                 if is_tp:
                     used[best_j] = True
                     if pr["conf"] >= conf:
@@ -2033,26 +2066,31 @@ def _score_model(model_path, mapping, items, classes, conf, iou_thr, contain, ti
                         tp[ci] += 1
                     else:
                         fp[ci] += 1
+                        if pr["dup"]:
+                            fp_dup[ci] += 1
+                        else:
+                            fp_bg[ci] += 1
         per_image.append({
             "p": it["rel"], "n": it["img"],
             "gtm": [1 if g.get("m") else 0 for g in gts],
             "pd": [[b["cls"], r5(b["cx"]), r5(b["cy"]), r5(b["w"]), r5(b["h"]),
-                    round(float(b["conf"]), 3), 1 if b.get("tp") else 0]
+                    round(float(b["conf"]), 3), 1 if b.get("tp") else 0,
+                    1 if b.get("dup") else 0]
                    for b in preds if b["conf"] >= conf],
         })
-    m = _assemble_metrics(classes, gt_count, tp, fp, det_pool)
+    m = _assemble_metrics(classes, gt_count, tp, fp, det_pool, fp_dup, fp_bg)
     m["images"] = n_images
     return m, per_image, ((t_infer * 1000.0 / n_images) if n_images else 0.0)
 
 
 def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mapping,
-                 contain=True, config=None):
+                 contain=True, dedup=False, config=None):
     try:
         _set_val(state="loading", message="fetching ground truth…", n_tasks=len(task_ids))
         items = _prepare_gt(task_ids, classes, say=lambda m: _set_val(message=m))
         _set_val(state="scoring", total=len(items), done=0, message="loading model…")
         m, per_image, ms = _score_model(
-            model_path, mapping, items, classes, conf, iou_thr, contain,
+            model_path, mapping, items, classes, conf, iou_thr, contain, dedup,
             tick=lambda k, n: _set_val(done=k, message=f"scoring {k+1}/{n}…"))
         r5 = lambda v: round(float(v), 5)
         details = []
@@ -2063,7 +2101,8 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                 details.append({"p": pi["p"], "n": pi["n"], "gt": gt, "pd": pi["pd"]})
         result = dict(m)
         result.update({"tasks": len(task_ids), "conf": conf, "iou": iou_thr,
-                       "contain": bool(contain), "ms_per_image": round(ms, 1),
+                       "contain": bool(contain), "dedup": bool(dedup),
+                       "ms_per_image": round(ms, 1),
                        "model": (config or {}).get("model_name") or os.path.basename(model_path),
                        "name": (config or {}).get("name") or "",
                        "model_file": os.path.basename(model_path),
@@ -2133,17 +2172,17 @@ def _save_cmp_history(hist):
 
 
 def _do_compare(mp_a, mp_b, project_id, task_ids, classes, conf, iou_thr,
-                map_a, map_b, contain=True, config=None):
+                map_a, map_b, contain=True, dedup=False, config=None):
     try:
         _set_cmp(state="loading", message="fetching ground truth…", n_tasks=len(task_ids))
         items = _prepare_gt(task_ids, classes, say=lambda m: _set_cmp(message=m))
         N = len(items)
         _set_cmp(state="scoring", total=N * 2, done=0)
         ma, pia, ms_a = _score_model(
-            mp_a, map_a, items, classes, conf, iou_thr, contain,
+            mp_a, map_a, items, classes, conf, iou_thr, contain, dedup,
             tick=lambda k, n: _set_cmp(done=k, message=f"model A: {k+1}/{n}…"))
         mb, pib, ms_b = _score_model(
-            mp_b, map_b, items, classes, conf, iou_thr, contain,
+            mp_b, map_b, items, classes, conf, iou_thr, contain, dedup,
             tick=lambda k, n: _set_cmp(done=N + k, message=f"model B: {k+1}/{n}…"))
 
         # ---- agreement over every ground-truth object: who found what?
@@ -2189,6 +2228,7 @@ def _do_compare(mp_a, mp_b, project_id, task_ids, classes, conf, iou_thr,
                                 "union": both + only_a + only_b},
                   "images": ma["images"], "tasks": len(task_ids),
                   "conf": conf, "iou": iou_thr, "contain": bool(contain),
+                  "dedup": bool(dedup),
                   "project_id": project_id, "name": cfg.get("name") or ""}
         import time
         finished_at = time.strftime("%Y-%m-%d %H:%M")
@@ -2236,12 +2276,13 @@ def api_cmp_run():
     except (TypeError, ValueError):
         iou_thr = 0.5
     contain = bool(data.get("contain", True))
+    dedup = bool(data.get("dedup", False))
     config = {"model_a": data.get("model_a"), "model_b": data.get("model_b"),
               "model_a_name": (data.get("model_a_name") or "").strip() or os.path.basename(mp_a),
               "model_b_name": (data.get("model_b_name") or "").strip() or os.path.basename(mp_b),
               "name": (data.get("name") or "").strip()[:80],
               "project_id": project_id, "task_ids": task_ids, "classes": list(classes),
-              "conf": conf, "iou": iou_thr, "contain": contain,
+              "conf": conf, "iou": iou_thr, "contain": contain, "dedup": dedup,
               "mapping_a": {str(k): v for k, v in map_a.items()},
               "mapping_b": {str(k): v for k, v in map_b.items()}}
     with _cmp_lock:
@@ -2252,7 +2293,7 @@ def api_cmp_run():
                         config=config, finished_at=None)
     threading.Thread(target=_do_compare,
                      args=(mp_a, mp_b, project_id, task_ids, list(classes), conf, iou_thr,
-                           map_a, map_b, contain, config), daemon=True).start()
+                           map_a, map_b, contain, dedup, config), daemon=True).start()
     return jsonify({"started": True})
 
 
@@ -2412,13 +2453,14 @@ def api_val_run():
     if not mapping:
         return jsonify({"error": "map at least one model class"}), 400
     contain = bool(data.get("contain", True))     # containment counts as a match
+    dedup = bool(data.get("dedup", False))       # merge stacked duplicate boxes first
     # the name the user dropped (display) vs the unique file we stored it as
     display = (data.get("model_name") or "").strip() or os.path.basename(model_path)
     run_name = (data.get("name") or "").strip()[:80]
     config = {"model": data.get("model"), "model_name": display, "name": run_name,
               "model_file": os.path.basename(model_path),
               "project_id": project_id, "task_ids": task_ids, "classes": list(classes),
-              "conf": conf, "iou": iou_thr, "contain": contain,
+              "conf": conf, "iou": iou_thr, "contain": contain, "dedup": dedup,
               "mapping": {str(k): v for k, v in mapping.items()}}
     with _val_lock:
         if _val_job["running"]:
@@ -2428,7 +2470,7 @@ def api_val_run():
                         error=None, config=config, finished_at=None)
     threading.Thread(target=_do_validate,
                      args=(model_path, project_id, task_ids, list(classes), conf, iou_thr,
-                           mapping, contain, config),
+                           mapping, contain, dedup, config),
                      daemon=True).start()
     return jsonify({"started": True, "tasks": len(task_ids)})
 
@@ -2921,7 +2963,8 @@ HTML = r"""<!DOCTYPE html>
   .cbadge.fn{background:rgba(245,158,11,.18);color:#d97706;}
   .lg{width:10px;height:10px;border-radius:3px;display:inline-block;margin-right:5px;flex:none;}
   .lg.gt{background:#3b82f6;} .lg.tp{background:#22c55e;}
-  .lg.fp{background:#ef4444;} .lg.fn{background:#f59e0b;}
+  .lg.fp{background:#ef4444;} .lg.fn{background:#f59e0b;} .lg.dup{background:#a855f7;}
+  .cbadge.dup{background:rgba(168,85,247,.16);color:#a855f7;}
   .vc-panels{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px 16px;}
   @media(max-width:1000px){.vc-panels{grid-template-columns:1fr;}}
   .vc-panel{display:flex;flex-direction:column;min-height:0;background:var(--surface);
@@ -3523,6 +3566,10 @@ HTML = r"""<!DOCTYPE html>
             <span class="valhint">&mdash; if the prediction contains the ground truth (or vice&#8209;versa), it counts as a TP even when the IoU is low.</span>
           </span>
         </label>
+        <label class="tick valtick"><input type="checkbox" id="valdedup">
+          <span>Merge duplicate detections (NMS)
+            <span class="valhint">&mdash; if the model stacks two boxes on one object, keep only the most confident. Off by default; end&#8209;to&#8209;end models get no NMS from ultralytics.</span></span>
+        </label>
         <div id="valmsg" class="aamsg"></div>
       </div>
       <div class="modal-f">
@@ -3573,7 +3620,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="vc-cvwrap"><canvas id="vcGtCv"></canvas></div>
       </div>
       <div class="vc-panel">
-        <div class="vc-h"><span class="lg tp"></span><span class="lg fp"></span><span class="lg fn"></span>Model prediction <span class="vc-n" id="vcPdN"></span></div>
+        <div class="vc-h"><span class="lg tp"></span><span class="lg fp"></span><span class="lg dup"></span><span class="lg fn"></span>Model prediction <span class="vc-n" id="vcPdN"></span></div>
         <div class="vc-cvwrap"><canvas id="vcPdCv"></canvas></div>
       </div>
     </div>
@@ -3633,6 +3680,10 @@ HTML = r"""<!DOCTYPE html>
         <label class="tick valtick"><input type="checkbox" id="cmpcontain" checked>
           <span>Count a box fully inside the other as a match
             <span class="valhint">&mdash; applied identically to both models.</span></span>
+        </label>
+        <label class="tick valtick"><input type="checkbox" id="cmpdedup">
+          <span>Merge duplicate detections (NMS)
+            <span class="valhint">&mdash; if the model stacks two boxes on one object, keep only the most confident. Off by default; end&#8209;to&#8209;end models get no NMS from ultralytics.</span></span>
         </label>
         <div id="cmpmsg" class="aamsg"></div>
       </div>
@@ -5317,6 +5368,7 @@ async function valPrefill(cfg){
     document.getElementById('valconf').value=0.4;      // conf always starts at the default
     if(cfg.iou!=null) document.getElementById('valiou').value=cfg.iou;
     if(cfg.contain!=null) document.getElementById('valcontain').checked=!!cfg.contain;
+    if(cfg.dedup!=null) document.getElementById('valdedup').checked=!!cfg.dedup;
     const sel=document.getElementById('valproj');
     sel.value=String(cfg.project_id); syncDD(sel);
     if(!sel.value) return;                       // project no longer in the list
@@ -5337,7 +5389,7 @@ function _valCard(which){          // which: cfg | map | prog | result | hist | 
   document.getElementById('valagain').style.display   = ['result','hist'].includes(which)?'':'none';
 }
 // ---- per-class image viewer: ground truth beside what the model predicted ----
-const VC_COL={gt:'#3b82f6', tp:'#22c55e', fp:'#ef4444', fn:'#f59e0b'};
+const VC_COL={gt:'#3b82f6', tp:'#22c55e', fp:'#ef4444', fn:'#f59e0b', dup:'#a855f7'};
 let vcAll=[], vcImgs=[], vcIdx=0, vcFilter='all';
 function vcBadges(tp,fp,fn){
   return (tp?'<span class="cbadge tp">TP '+tp+'</span>':'')
@@ -5406,7 +5458,7 @@ function vcShow(i){
   const im=new Image();
   im.onload=()=>{
     vcPaint('vcGtCv', im, r.gt.map(b=>({b, k:'gt'})));
-    vcPaint('vcPdCv', im, r.pd.map(b=>({b, k:b[6]?'tp':'fp'}))
+    vcPaint('vcPdCv', im, r.pd.map(b=>({b, k:b[6]?'tp':(b[7]?'dup':'fp')}))
                             .concat(r.gt.filter(b=>!b[5]).map(b=>({b, k:'fn'}))));
   };
   im.src='/api/val/image?p='+encodeURIComponent(r.p);
@@ -5429,7 +5481,7 @@ function vcPaint(id, im, items){
     ctx.strokeRect(x,y,w,h);
     ctx.setLineDash([]);
     const lab = k==='gt' ? 'GT' : k==='fn' ? 'MISSED'
-              : (k==='tp'?'TP ':'FP ')+Number(b[5]).toFixed(2);
+              : (k==='tp'?'TP ':k==='dup'?'DUP ':'FP ')+Number(b[5]).toFixed(2);
     ctx.font='bold 11px system-ui,Arial';
     const tw=ctx.measureText(lab).width+8, ty=Math.max(0,y-15);
     ctx.fillStyle=col; ctx.fillRect(x,ty,tw,15);
@@ -5631,7 +5683,8 @@ async function runValidation(){
     task_ids:valCheckedTasks(), classes:valGtClasses, mapping,
     conf:parseFloat(document.getElementById('valconf').value)||0.4,
     iou:parseFloat(document.getElementById('valiou').value)||0.5,
-    contain:document.getElementById('valcontain').checked };
+    contain:document.getElementById('valcontain').checked,
+    dedup:document.getElementById('valdedup').checked };
   valMsg('','valmsg2'); valShowProg();
   document.getElementById('valprogtext').textContent='starting…';
   try{
@@ -5721,6 +5774,18 @@ function valInsights(res){
       notes.push('Recall ('+pct(o.recall)+') exceeds precision ('+pct(o.precision)
         +') — it detects a lot but much of it is wrong. Try <b>raising the confidence</b> threshold.');
   }
+  // duplicate-box diagnosis — the single most actionable finding when it fires
+  if((o.fp_dup||0)>0){
+    const share=(o.fp||0)? (o.fp_dup/o.fp) : 0;
+    bad.push('<b>'+o.fp_dup+' of its '+o.fp+' false positive'+(o.fp===1?'':'s')+' '
+      +(o.fp_dup===1?'is a duplicate box':'are duplicate boxes')+'</b> ('+pct(share)
+      +' of them) — a second box stacked on an object it had already found, not a hallucination. '
+      +'Merging them (NMS) would lift precision from <b>'+pct(o.precision||0)+'</b> to <b>'
+      +pct(o.precision_nodup||0)+'</b> without changing recall.');
+    notes.push('Tick <b>Merge duplicate detections (NMS)</b> and re-run to score the model as it would behave '
+      +'with de-duplication at deployment. End-to-end (NMS-free) models get no NMS from ultralytics, so they '
+      +'can stack boxes on one object.');
+  }
   const tiny=scored.filter(c=>c.gt<5);
   if(tiny.length)
     notes.push(tiny.length+' class(es) have fewer than 5 ground-truth objects ('
@@ -5741,12 +5806,16 @@ function renderValResult(res, finishedAt){
     +'<div class="val-tile"><div class="vt-k" title="TP / (TP + FP + FN)">Accuracy</div><div class="vt-v">'+pct(accOf(o))+'</div></div>'
     +'<div class="val-tile"><div class="vt-k">Images</div><div class="vt-v">'+(res.images||0)+'</div></div>'
     +'<div class="val-tile"><div class="vt-k">TP / FP / FN</div><div class="vt-v" style="font-size:16px;">'
-      +(o.tp||0)+' / '+(o.fp||0)+' / '+(o.fn||0)+'</div></div>'
+      +(o.tp||0)+' / '+(o.fp||0)+' / '+(o.fn||0)+'</div>'
+      +((o.fp_dup||0)?('<div style="font-size:11px;color:var(--text-muted);margin-top:5px;">FP = <b style="color:#a855f7;">'
+        +o.fp_dup+' duplicate</b> + '+(o.fp_bg||0)+' background</div>'):'')
+      +'</div>'
     +'</div>';
   if(res.name) h+='<div class="val-name">'+escapeHtml(res.name)+'</div>';
   h+='<div class="val-sub">'+escapeHtml(res.model||'')+' &nbsp;·&nbsp; project '+escapeHtml(String(res.project_id||''))
     +' &nbsp;·&nbsp; '+(res.tasks||0)+' task(s) &nbsp;·&nbsp; conf &ge; '+res.conf+' &nbsp;·&nbsp; IoU &ge; '+res.iou
     +(res.contain ? ' <b>or contained</b>' : '')
+    +(res.dedup ? ' &nbsp;·&nbsp; <b>duplicates merged (NMS)</b>' : '')
     +(finishedAt?(' &nbsp;·&nbsp; <b>last run '+escapeHtml(finishedAt)+'</b>'):'')
     +' &nbsp;·&nbsp; ground truth was only read, never modified</div>';
 
@@ -5768,18 +5837,22 @@ function renderValResult(res, finishedAt){
   if(ins.notes.length)
     h+='<div class="ins-notes"><ul>'+ins.notes.map(t=>'<li>'+t+'</li>').join('')+'</ul></div>';
 
-  h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th><th>TP</th><th>FP</th><th>FN</th>'
+  h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th><th>TP</th><th>FP</th>'
+    +'<th title="FP boxes stacked on an object the model already found">FP dup</th><th>FN</th>'
     +'<th>Precision</th><th>Recall</th><th>F1</th><th title="TP / (TP + FP + FN)">Accuracy</th>'
     +'<th>AP@50</th></tr></thead><tbody>';
   (res.per_class||[]).forEach((c,ci)=>{
     const dim = c.gt ? '' : ' class="dim"';
     const nm = '<button class="clslink" title="see the images for this class" onclick="valOpenClass('+ci+')">'
       +escapeHtml(c.name)+'</button>';
-    h+='<tr><td>'+nm+'</td><td'+dim+'>'+c.gt+'</td><td>'+c.tp+'</td><td>'+c.fp+'</td><td>'+c.fn+'</td>'
+    h+='<tr><td>'+nm+'</td><td'+dim+'>'+c.gt+'</td><td>'+c.tp+'</td><td>'+c.fp+'</td>'
+      +'<td'+((c.fp_dup||0)?' style="color:#a855f7;font-weight:700;"':' class="dim"')+'>'+(c.fp_dup||0)+'</td>'
+      +'<td>'+c.fn+'</td>'
       +'<td>'+pct(c.precision)+'</td><td>'+pct(c.recall)+'</td><td>'+pct(c.f1)+'</td>'
       +'<td>'+pct(accOf(c))+'</td><td>'+c.ap50.toFixed(3)+'</td></tr>';
   });
-  h+='<tr class="total"><td>ALL</td><td>'+(o.gt||0)+'</td><td>'+(o.tp||0)+'</td><td>'+(o.fp||0)+'</td><td>'+(o.fn||0)+'</td>'
+  h+='<tr class="total"><td>ALL</td><td>'+(o.gt||0)+'</td><td>'+(o.tp||0)+'</td><td>'+(o.fp||0)+'</td>'
+    +'<td>'+(o.fp_dup||0)+'</td><td>'+(o.fn||0)+'</td>'
     +'<td>'+pct(o.precision||0)+'</td><td>'+pct(o.recall||0)+'</td><td>'+pct(o.f1||0)+'</td>'
     +'<td>'+pct(accOf(o))+'</td><td>'+(o.map50||0).toFixed(3)+'</td></tr>';
   h+='</tbody></table>';
@@ -5822,6 +5895,7 @@ async function cmpPrefill(cfg){
     document.getElementById('cmpconf').value=0.4;
     if(cfg.iou!=null) document.getElementById('cmpiou').value=cfg.iou;
     if(cfg.contain!=null) document.getElementById('cmpcontain').checked=!!cfg.contain;
+    if(cfg.dedup!=null) document.getElementById('cmpdedup').checked=!!cfg.dedup;
     const sel=document.getElementById('cmpproj');
     sel.value=String(cfg.project_id); syncDD(sel);
     if(!sel.value) return;
@@ -5944,7 +6018,8 @@ async function runCompare(){
     classes:cmpGt, mapping_a:ma, mapping_b:mb,
     conf:parseFloat(document.getElementById('cmpconf').value)||0.4,
     iou:parseFloat(document.getElementById('cmpiou').value)||0.5,
-    contain:document.getElementById('cmpcontain').checked };
+    contain:document.getElementById('cmpcontain').checked,
+    dedup:document.getElementById('cmpdedup').checked };
   cmpMsg('','cmpmsg2'); cmpShowProg();
   document.getElementById('cmpprogtext').textContent='starting…';
   try{
@@ -5995,7 +6070,7 @@ function renderCmpResult(res, finishedAt){
     +' &nbsp;vs&nbsp; <span class="ab b">B</span>'+escapeHtml(b.model||'')
     +' &nbsp;·&nbsp; project '+escapeHtml(String(res.project_id||''))+' &nbsp;·&nbsp; '
     +(res.tasks||0)+' task(s), '+(res.images||0)+' images &nbsp;·&nbsp; conf &ge; '+res.conf
-    +' &nbsp;·&nbsp; IoU &ge; '+res.iou+(res.contain?' or contained':'')
+    +' &nbsp;·&nbsp; IoU &ge; '+res.iou+(res.contain?' or contained':'')+(res.dedup?' · duplicates merged (NMS)':'')
     +(finishedAt?(' &nbsp;·&nbsp; <b>'+escapeHtml(finishedAt)+'</b>'):'')
     +' &nbsp;·&nbsp; both scored on identical ground truth, which was only read</div>';
   // verdict
@@ -6028,7 +6103,14 @@ function renderCmpResult(res, finishedAt){
     +'<div><div class="ag-k"><span class="ab b">B</span>only B</div><div class="ag-v">'+(ag.only_b||0)+'</div><div class="ag-k">'+p(ag.only_b||0)+'</div></div>'
     +'<div><div class="ag-k">Neither found</div><div class="ag-v">'+(ag.neither||0)+'</div><div class="ag-k">'+p(ag.neither||0)+'</div></div>'
     +'<div><div class="ag-k">A or B (ensemble)</div><div class="ag-v">'+(ag.union||0)+'</div><div class="ag-k">'+p(ag.union||0)+'</div></div>'
-    +'</div><ul style="margin:10px 0 0;padding-left:17px;">'
+    +'</div>'
+    + (((oa.fp_dup||0)+(ob.fp_dup||0)) ? ('<ul style="margin:10px 0 0;padding-left:17px;"><li style="font-size:12.5px;color:var(--text);line-height:1.55;">'
+        +'<b>Duplicate boxes:</b> <span class="ab a">A</span>'+(oa.fp_dup||0)+' of '+(oa.fp||0)+' FPs · '
+        +'<span class="ab b">B</span>'+(ob.fp_dup||0)+' of '+(ob.fp||0)+' FPs are stacked on an object already found. '
+        +'With NMS their precision would be <span class="ab a">A</span>'+pct(oa.precision_nodup||oa.precision||0)
+        +' · <span class="ab b">B</span>'+pct(ob.precision_nodup||ob.precision||0)
+        +' (from '+pct(oa.precision||0)+' / '+pct(ob.precision||0)+').</li></ul>') : '')
+    +'<ul style="margin:10px 0 0;padding-left:17px;">'
     +'<li style="font-size:12.5px;color:var(--text);line-height:1.55;">'
       +((ag.only_b||0)>(ag.only_a||0)*2
         ? '<b>B strictly dominates</b> — it finds '+(ag.only_b||0)+' objects A misses, while A only finds '+(ag.only_a||0)+' that B misses.'
@@ -6181,9 +6263,9 @@ function ccShow(i){
   const im=new Image();
   im.onload=()=>{
     vcPaint('ccGtCv', im, r.gt.map(b=>({b,k:'gt'})));
-    vcPaint('ccACv', im, r.a.map(b=>({b,k:b[6]?'tp':'fp'}))
+    vcPaint('ccACv', im, r.a.map(b=>({b,k:b[6]?'tp':(b[7]?'dup':'fp')}))
       .concat(r.gt.filter(b=>!b[5]).map(b=>({b,k:'fn'}))));
-    vcPaint('ccBCv', im, r.b.map(b=>({b,k:b[6]?'tp':'fp'}))
+    vcPaint('ccBCv', im, r.b.map(b=>({b,k:b[6]?'tp':(b[7]?'dup':'fp')}))
       .concat(r.gt.filter(b=>!b[6]).map(b=>({b,k:'fn'}))));
   };
   im.src='/api/val/image?p='+encodeURIComponent(r.p);
