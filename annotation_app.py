@@ -3538,6 +3538,9 @@ HTML = r"""<!DOCTYPE html>
         <div class="bar indet" id="valbarwrap"><div id="valbar"></div></div>
         <div id="valprogtext" style="font-size:13px;color:var(--text);margin-top:8px;"></div>
       </div>
+      <div class="modal-f">
+        <button onclick="minimizeJob('val')"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>Minimize</button>
+      </div>
     </div>
   </div>
   <div id="valresult" class="val-result" style="display:none;"></div>
@@ -3643,6 +3646,9 @@ HTML = r"""<!DOCTYPE html>
         <div class="bar indet"><div id="cmpbar"></div></div>
         <div id="cmpprogtext" style="font-size:13px;color:var(--text);margin-top:8px;"></div>
       </div>
+      <div class="modal-f">
+        <button onclick="minimizeJob('cmp')"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>Minimize</button>
+      </div>
     </div>
   </div>
   <div id="cmpresult" class="val-result" style="display:none;"></div>
@@ -3679,6 +3685,18 @@ HTML = r"""<!DOCTYPE html>
       <button id="confirmOk" class="ok" onclick="_confirmResolve(true)">OK</button>
     </div>
   </div>
+</div>
+
+<div id="jobwidget" class="apw" style="display:none;">
+  <div class="apw-top">
+    <span class="apw-dot"></span>
+    <span class="apw-title" id="jwTitle">Working…</span>
+    <span class="spacer"></span>
+    <button class="apw-icon" onclick="jwRestore()" title="open full view"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
+    <button class="apw-icon" onclick="jwDismiss()" title="hide"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+  </div>
+  <div class="apw-bar"><div id="jwBar"></div></div>
+  <div id="jwText" class="apw-text"></div>
 </div>
 
 <div id="apwidget" class="apw" style="display:none;">
@@ -3769,6 +3787,30 @@ function toggleTheme(){
   try{ localStorage.setItem('theme', next); }catch(e){}   // remember the last choice
   updateThemeIcons();
 }
+// ---- minimize a running validation / comparison to a floating pill ----
+let jwOwner=null;
+function jwShow(on){ const w=document.getElementById('jobwidget'); if(w) w.style.display=on?'block':'none'; }
+function jwSet(pct, text, done, title){
+  const bar=document.getElementById('jwBar'), t=document.getElementById('jwText'),
+        w=document.getElementById('jobwidget'), h=document.getElementById('jwTitle');
+  if(bar) bar.style.width=Math.max(0,Math.min(100,pct))+'%';
+  if(t) t.textContent=text||'';
+  if(h) h.textContent=title||'Working…';
+  if(w) w.classList.toggle('done', !!done);
+}
+function minimizeJob(who){
+  jwOwner=who;
+  document.getElementById(who==='cmp'?'cmpview':'valview').style.display='none';
+  jwShow(true);
+}
+function jwRestore(){
+  jwShow(false);
+  const id = jwOwner==='cmp' ? 'cmpview' : 'valview';
+  appMode='cvat'; applyMode(); hideAllScreens();
+  document.getElementById(id).style.display='flex';   // whatever card the poll left active
+}
+function jwDismiss(){ jwShow(false); }
+
 // ---- in-app confirm dialog (replaces the browser's confirm popup) ----
 let _confirmCb=null;
 function appConfirm(message, opts){
@@ -5261,6 +5303,7 @@ async function enterVal(){
   hideAllScreens();
   document.getElementById('valview').style.display='flex';
   valShowCfg();
+  jwShow(false);                  // full view -> no floating pill
   valHistCount();                 // badge on the History button
   await valLoadProjects();
   let s=null;
@@ -5612,6 +5655,8 @@ function pollValidation(){
     let t=s.message||s.state||'';
     if(s.running && s.total) t+=' ('+s.done+'/'+s.total+')';
     document.getElementById('valprogtext').textContent=t;
+    jwSet(s.total?Math.round(s.done/s.total*100):(s.running?4:100), t, !s.running,
+          s.running?'Validating…':'Validation done');
     if(!s.running){
       clearInterval(valPoll);
       if(s.error) return;                       // leave the error shown
@@ -5771,7 +5816,7 @@ function cmpShowResult(){ _cmpCard('result'); }
 async function enterCmp(){
   appMode='cvat'; applyMode(); hideAllScreens();
   document.getElementById('cmpview').style.display='flex';
-  cmpShowCfg(); cmpHistCount();
+  cmpShowCfg(); jwShow(false); cmpHistCount();
   await cmpLoadProjects();
   let s=null; try{ s=await fetch('/api/cmp/status?t='+Date.now()).then(r=>r.json()); }catch(e){}
   if(!s) return;
@@ -5924,6 +5969,8 @@ function pollCompare(){
     let t=s.message||s.state||'';
     if(s.running && s.total) t+=' ('+s.done+'/'+s.total+')';
     document.getElementById('cmpprogtext').textContent=t;
+    jwSet(s.total?Math.round(s.done/s.total*100):(s.running?4:100), t, !s.running,
+          s.running?'Comparing models…':'Comparison done');
     if(!s.running){
       clearInterval(cmpPoll);
       if(s.error) return;
