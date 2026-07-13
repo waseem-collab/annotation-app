@@ -1291,9 +1291,9 @@ def api_cvat_autopipeline():
     if not model_path:
         return jsonify({"error": "invalid model"}), 400
     try:
-        conf = float(data.get("conf", 0.25) or 0.25)
+        conf = float(data.get("conf", 0.4) or 0.4)
     except (TypeError, ValueError):
-        conf = 0.25
+        conf = 0.4
     mode = data.get("mode")
     if mode not in ("skip", "append", "replace"):
         mode = "append"
@@ -1551,9 +1551,9 @@ def api_autoannotate(idx):
     if not model_path:
         return jsonify({"error": "invalid model"}), 400
     try:
-        conf = float(request.args.get("conf", "0.25") or 0.25)
+        conf = float(request.args.get("conf", "0.4") or 0.4)
     except ValueError:
-        conf = 0.25
+        conf = 0.4
     try:
         dets, model_names = _infer(model_path, os.path.join(IMG_DIR, IMAGES[idx]), conf)
     except Exception as e:
@@ -1665,9 +1665,9 @@ def api_autoannotate_all():
     if not model_specs:
         return jsonify({"error": "select at least one model"}), 400
     try:
-        conf = float(data.get("conf", 0.25) or 0.25)
+        conf = float(data.get("conf", 0.4) or 0.4)
     except (TypeError, ValueError):
-        conf = 0.25
+        conf = 0.4
     classes = data.get("classes")
     if not isinstance(classes, list):
         classes = list(CLASSES)
@@ -2038,9 +2038,9 @@ def api_val_run():
     if not classes:
         return jsonify({"error": "no project classes"}), 400
     try:
-        conf = float(data.get("conf", 0.25) or 0.25)
+        conf = float(data.get("conf", 0.4) or 0.4)
     except (TypeError, ValueError):
-        conf = 0.25
+        conf = 0.4
     try:
         iou_thr = float(data.get("iou", 0.5) or 0.5)
     except (TypeError, ValueError):
@@ -2768,7 +2768,7 @@ HTML = r"""<!DOCTYPE html>
           <button type="button" onclick="aaSelectAllModels(false)">None</button>
         </div>
         <label>Confidence</label>
-        <input id="aaconf" type="number" min="0" max="1" step="0.05" value="0.25">
+        <input id="aaconf" type="number" min="0" max="1" step="0.05" value="0.4">
         <label>If a label already exists</label>
         <select id="aamode">
           <option value="append">add detections to it</option>
@@ -2910,7 +2910,7 @@ HTML = r"""<!DOCTYPE html>
         <label>Model</label>
         <select id="apmodel"><option value="">— loading models… —</option></select>
         <label>Confidence</label>
-        <input id="apconf" type="number" min="0" max="1" step="0.05" value="0.25">
+        <input id="apconf" type="number" min="0" max="1" step="0.05" value="0.4">
         <label>Existing annotations</label>
         <select id="apmode">
           <option value="append">add detections to them</option>
@@ -2972,7 +2972,7 @@ HTML = r"""<!DOCTYPE html>
           <button onclick="valSelectAll(false)">None</button>
         </div>
         <div class="val-two">
-          <div><label>Confidence</label><input id="valconf" type="number" min="0" max="1" step="0.05" value="0.25"></div>
+          <div><label>Confidence</label><input id="valconf" type="number" min="0" max="1" step="0.05" value="0.4"></div>
           <div><label>IoU match</label><input id="valiou" type="number" min="0.05" max="0.95" step="0.05" value="0.5"></div>
         </div>
         <div id="valmsg" class="aamsg"></div>
@@ -3835,7 +3835,7 @@ async function openAaModal(){
 function closeAaModal(){ document.getElementById('aamodal').style.display='none'; }
 let aaPoll=null;
 async function runAutoAnnotate(){
-  const conf=parseFloat(document.getElementById('aaconf').value)||0.25;
+  const conf=parseFloat(document.getElementById('aaconf').value)||0.4;
   const mode=document.getElementById('aamode').value;
   // gather a per-model class mapping from each model's group of dropdowns
   const models=[];
@@ -4441,7 +4441,7 @@ function buildApMap(){
 async function runAutoPipeline(){
   const tasks=apCheckedTasks();
   const model=document.getElementById('apmodel').value;
-  const conf=parseFloat(document.getElementById('apconf').value)||0.25;
+  const conf=parseFloat(document.getElementById('apconf').value)||0.4;
   const mode=document.getElementById('apmode').value;
   const mapping={};
   document.querySelectorAll('#apmaplist select').forEach(s=>{
@@ -4801,7 +4801,7 @@ async function runValidation(){
   if(!Object.keys(mapping).length){ valMsg('map at least one class','valmsg2'); return; }
   const body={ model:valModel.path, project_id:document.getElementById('valproj').value,
     task_ids:valCheckedTasks(), classes:valGtClasses, mapping,
-    conf:parseFloat(document.getElementById('valconf').value)||0.25,
+    conf:parseFloat(document.getElementById('valconf').value)||0.4,
     iou:parseFloat(document.getElementById('valiou').value)||0.5 };
   valMsg('','valmsg2'); valShowProg();
   document.getElementById('valprogtext').textContent='starting…';
