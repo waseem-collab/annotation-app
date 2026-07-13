@@ -1691,6 +1691,294 @@ def api_autoannotate_status():
         return jsonify(dict(_aa_job))
 
 
+# --------------------------------------------------------------------------- #
+# Model validation against a CVAT ground-truth project.
+#
+# STRICTLY READ-ONLY on CVAT: this only *exports* (downloads) task data. It never
+# uploads, imports annotations, removes annotations or edits the project in any
+# way. Ground truth is cached under VAL_DIR, which is separate from IMPORTS_DIR so
+# it can never clobber folders you are editing.
+# --------------------------------------------------------------------------- #
+VAL_DIR = os.getenv("VAL_DIR") or os.path.join(BASE, "validation")
+UPLOAD_MODELS_DIR = os.path.join(MODELS_DIR, "_uploaded")
+
+
+def _val_task_dirs(task_id):
+    return [d for d in glob.glob(os.path.join(VAL_DIR, f"{task_id}_*"))
+            if os.path.isdir(os.path.join(d, "images"))]
+
+
+def _val_fetch_task(task_id, status=None):
+    """Download a task's images + ground-truth labels into VAL_DIR (export only).
+    Re-uses an existing copy when it's still current with CVAT."""
+    import tempfile
+    import shutil
+
+    def say(m):
+        if status:
+            status(m)
+    session = _cvat_session()
+    info = session.get(f"{CVAT_URL}/api/tasks/{task_id}").json()
+    tname = info.get("name") or f"task_{task_id}"
+    updated = info.get("updated_date")
+    for d in _val_task_dirs(task_id):                 # reuse if still current
+        try:
+            with open(os.path.join(d, ".cvat_task.json"), encoding="utf-8") as fh:
+                link = json.load(fh)
+        except (OSError, ValueError):
+            link = {}
+        if updated and _norm_dt(link.get("updated_date")) == _norm_dt(updated):
+            return d
+    zip_path = None
+    try:
+        fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cvat_val_")
+        os.close(fd)
+        say(f"downloading ground truth '{tname}'…")
+        _cvat_export_task(session, task_id, zip_path)   # export = read-only
+        for d in glob.glob(os.path.join(VAL_DIR, f"{task_id}_*")):
+            shutil.rmtree(d, ignore_errors=True)
+        out_dir = os.path.join(VAL_DIR, f"{task_id}_{_safe_name(tname)}")
+        os.makedirs(out_dir, exist_ok=True)
+        say("extracting…")
+        _extract_yolo_export(zip_path, out_dir)
+        try:
+            with open(os.path.join(out_dir, ".cvat_task.json"), "w", encoding="utf-8") as fh:
+                json.dump({"task_id": int(task_id), "task_name": tname,
+                           "updated_date": updated}, fh)
+        except OSError:
+            pass
+        return out_dir
+    finally:
+        if zip_path and os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+
+def _iou(a, b):
+    """IoU of two normalised YOLO boxes {cx,cy,w,h}."""
+    ax1, ay1 = a["cx"] - a["w"] / 2, a["cy"] - a["h"] / 2
+    ax2, ay2 = a["cx"] + a["w"] / 2, a["cy"] + a["h"] / 2
+    bx1, by1 = b["cx"] - b["w"] / 2, b["cy"] - b["h"] / 2
+    bx2, by2 = b["cx"] + b["w"] / 2, b["cy"] + b["h"] / 2
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _average_precision(dets, n_gt):
+    """AP from detections [(conf, is_tp)] using all-point interpolation."""
+    if n_gt == 0 or not dets:
+        return 0.0
+    dets = sorted(dets, key=lambda d: -d[0])
+    tp = fp = 0
+    rec, prec = [], []
+    for _, is_tp in dets:
+        if is_tp:
+            tp += 1
+        else:
+            fp += 1
+        rec.append(tp / n_gt)
+        prec.append(tp / (tp + fp))
+    # make precision monotonically decreasing, then integrate over recall
+    for i in range(len(prec) - 2, -1, -1):
+        prec[i] = max(prec[i], prec[i + 1])
+    ap, prev_r = 0.0, 0.0
+    for r, p in zip(rec, prec):
+        ap += (r - prev_r) * p
+        prev_r = r
+    return ap
+
+
+_val_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
+            "cur_task": 0, "n_tasks": 0, "result": None, "error": None}
+_val_lock = threading.Lock()
+
+VAL_INFER_CONF = 0.01      # infer low so the PR curve (AP) is meaningful
+
+
+def _set_val(**kw):
+    with _val_lock:
+        _val_job.update(kw)
+
+
+def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mapping):
+    """Run the model over the project's ground truth and score it. Read-only."""
+    try:
+        n_cls = len(classes)
+        gt_count = [0] * n_cls
+        tp = [0] * n_cls
+        fp = [0] * n_cls
+        det_pool = [[] for _ in range(n_cls)]     # (conf, is_tp) for AP
+        n_images = 0
+        _set_val(state="loading", message="loading model…", n_tasks=len(task_ids))
+        _load_model(model_path)
+        for ti, tid in enumerate(task_ids, 1):
+            _set_val(cur_task=ti, message=f"task {ti}/{len(task_ids)}: fetching ground truth…")
+            d = _val_fetch_task(tid, status=lambda m: _set_val(message=f"[{ti}/{len(task_ids)}] {m}"))
+            img_dir = os.path.join(d, "images")
+            lbl_dir = os.path.join(d, "labels")
+            gt_classes = _classes_in(d)           # this task's label order
+            # map this task's GT class index -> our project class index (by name)
+            gt_to_proj = {}
+            lower = {str(n).strip().lower(): i for i, n in enumerate(classes)}
+            for gi, gn in enumerate(gt_classes):
+                pi = lower.get(str(gn).strip().lower())
+                if pi is not None:
+                    gt_to_proj[gi] = pi
+            images = sorted(os.listdir(img_dir)) if os.path.isdir(img_dir) else []
+            _set_val(total=len(images), done=0)
+            for i, img in enumerate(images):
+                if i % 5 == 0:
+                    _set_val(done=i, message=f"task {ti}/{len(task_ids)}: scoring {i+1}/{len(images)}…")
+                stem = os.path.splitext(img)[0]
+                # ---- ground truth for this image
+                gts = []
+                for b in _read_label_file(os.path.join(lbl_dir, stem + ".txt")):
+                    ci = gt_to_proj.get(int(b["cls"]))
+                    if ci is None:
+                        continue
+                    gts.append({"cls": ci, "cx": b["cx"], "cy": b["cy"], "w": b["w"], "h": b["h"]})
+                    gt_count[ci] += 1
+                # ---- predictions
+                try:
+                    dets, _ = _infer(model_path, os.path.join(img_dir, img), VAL_INFER_CONF)
+                except Exception:
+                    continue
+                preds = []
+                for dt in dets:
+                    ci = mapping.get(dt.get("cls_model"))
+                    if ci is None or not (0 <= ci < n_cls):
+                        continue
+                    preds.append({"cls": ci, "conf": dt["conf"], "cx": dt["cx"],
+                                  "cy": dt["cy"], "w": dt["w"], "h": dt["h"]})
+                n_images += 1
+                # ---- greedy match per class (highest confidence first)
+                for ci in range(n_cls):
+                    g = [x for x in gts if x["cls"] == ci]
+                    p = sorted([x for x in preds if x["cls"] == ci],
+                               key=lambda x: -x["conf"])
+                    used = [False] * len(g)
+                    for pr in p:
+                        best, best_j = 0.0, -1
+                        for j, gb in enumerate(g):
+                            if used[j]:
+                                continue
+                            v = _iou(pr, gb)
+                            if v > best:
+                                best, best_j = v, j
+                        is_tp = best >= iou_thr and best_j >= 0
+                        if is_tp:
+                            used[best_j] = True
+                        det_pool[ci].append((pr["conf"], is_tp))       # for AP (all conf)
+                        if pr["conf"] >= conf:                          # threshold metrics
+                            if is_tp:
+                                tp[ci] += 1
+                            else:
+                                fp[ci] += 1
+            _set_val(done=len(images))
+        # ---- assemble metrics
+        per_class, sum_ap, n_present = [], 0.0, 0
+        for ci in range(n_cls):
+            # TPs at the threshold are counted above; FN = GT not matched at threshold
+            matched = tp[ci]
+            fn = max(0, gt_count[ci] - matched)
+            prec = tp[ci] / (tp[ci] + fp[ci]) if (tp[ci] + fp[ci]) else 0.0
+            rec = matched / gt_count[ci] if gt_count[ci] else 0.0
+            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+            ap = _average_precision(det_pool[ci], gt_count[ci])
+            if gt_count[ci]:
+                sum_ap += ap
+                n_present += 1
+            per_class.append({"name": classes[ci], "gt": gt_count[ci], "tp": tp[ci],
+                              "fp": fp[ci], "fn": fn, "precision": prec, "recall": rec,
+                              "f1": f1, "ap50": ap})
+        TP, FP = sum(tp), sum(fp)
+        GT = sum(gt_count)
+        FN = max(0, GT - TP)
+        P = TP / (TP + FP) if (TP + FP) else 0.0
+        R = TP / GT if GT else 0.0
+        F1 = (2 * P * R / (P + R)) if (P + R) else 0.0
+        result = {"classes": classes, "per_class": per_class,
+                  "overall": {"gt": GT, "tp": TP, "fp": FP, "fn": FN,
+                              "precision": P, "recall": R, "f1": F1,
+                              "map50": (sum_ap / n_present) if n_present else 0.0},
+                  "images": n_images, "tasks": len(task_ids),
+                  "conf": conf, "iou": iou_thr,
+                  "model": os.path.basename(model_path), "project_id": project_id}
+        _set_val(running=False, state="done", result=result,
+                 message=f"done ✓ — {n_images} images, mAP@50 "
+                         f"{(sum_ap/n_present if n_present else 0):.3f}")
+    except Exception as e:
+        _set_val(running=False, state="error", error=str(e), message=f"validation failed: {e}")
+
+
+@app.route("/api/val/upload_model", methods=["POST"])
+def api_val_upload_model():
+    """Accept a dropped .pt file; store it under MODELS_DIR/_uploaded."""
+    f = request.files.get("model")
+    if not f or not f.filename:
+        return jsonify({"error": "no file"}), 400
+    if not f.filename.lower().endswith(".pt"):
+        return jsonify({"error": "not a .pt file"}), 400
+    os.makedirs(UPLOAD_MODELS_DIR, exist_ok=True)
+    safe = _safe_name(os.path.splitext(os.path.basename(f.filename))[0]) + ".pt"
+    dest = os.path.join(UPLOAD_MODELS_DIR, safe)
+    f.save(dest)
+    rel = os.path.relpath(dest, MODELS_DIR)
+    return jsonify({"ok": True, "path": rel, "name": safe,
+                    "size": os.path.getsize(dest)})
+
+
+@app.route("/api/val/run", methods=["POST"])
+def api_val_run():
+    data = request.get_json(force=True) or {}
+    model_path = _safe_model_path(data.get("model", ""))
+    if not model_path:
+        return jsonify({"error": "invalid model"}), 400
+    project_id = data.get("project_id")
+    task_ids = data.get("task_ids") or []
+    if not project_id:
+        return jsonify({"error": "select a ground-truth project"}), 400
+    if not task_ids:
+        return jsonify({"error": "select at least one task"}), 400
+    classes = data.get("classes") or []
+    if not classes:
+        return jsonify({"error": "no project classes"}), 400
+    try:
+        conf = float(data.get("conf", 0.25) or 0.25)
+    except (TypeError, ValueError):
+        conf = 0.25
+    try:
+        iou_thr = float(data.get("iou", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        iou_thr = 0.5
+    mapping = _parse_mapping(data.get("mapping"))
+    if not mapping:
+        return jsonify({"error": "map at least one model class"}), 400
+    with _val_lock:
+        if _val_job["running"]:
+            return jsonify({"error": "a validation is already running"}), 409
+        _val_job.update(running=True, state="starting", message="starting…", done=0,
+                        total=0, cur_task=0, n_tasks=len(task_ids), result=None, error=None)
+    threading.Thread(target=_do_validate,
+                     args=(model_path, project_id, task_ids, list(classes), conf, iou_thr, mapping),
+                     daemon=True).start()
+    return jsonify({"started": True, "tasks": len(task_ids)})
+
+
+@app.route("/api/val/status")
+def api_val_status():
+    with _val_lock:
+        return jsonify(dict(_val_job))
+
+
 @app.route("/")
 def index():
     return Response(HTML, mimetype="text/html")
@@ -1924,6 +2212,45 @@ HTML = r"""<!DOCTYPE html>
      centred form card), consistent with the Import / Class-count screens */
   #apmodal{z-index:195;}
   .ap-page{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start;padding:30px 20px;}
+  /* ---- model validation ---- */
+  #valview{z-index:196;}
+  .home-card.val .hc-icon{background:rgba(45,212,191,.15);color:#14b8a6;}
+  .val-ro{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-muted);
+    background:var(--surface-2);border:1px solid var(--border);border-radius:999px;padding:4px 10px;margin-left:10px;}
+  .val-page{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start;padding:26px 20px;}
+  .dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;
+    padding:22px 14px;border:2px dashed var(--border-2);border-radius:var(--r-lg);background:var(--bg);
+    color:var(--text-muted);cursor:pointer;text-align:center;
+    transition:border-color .15s,background .15s,color .15s;}
+  .dropzone:hover,.dropzone.over{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);}
+  .dropzone .dz-main{font-size:13px;color:var(--text);}
+  .dropzone .dz-sub{font-size:11.5px;}
+  .val-model{display:flex;align-items:center;gap:9px;padding:9px 11px;margin-top:2px;
+    background:var(--ok-soft);border:1px solid rgba(52,211,153,.35);border-radius:var(--r);
+    font-size:12.5px;color:var(--text);}
+  .val-model .vm-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .val-model .vm-size{color:var(--text-muted);flex:none;margin-left:auto;}
+  .val-two{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .val-result{flex:1;overflow:auto;padding:22px 24px;}
+  .val-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px;}
+  .val-tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);
+    padding:14px 16px;box-shadow:var(--sh-sm);}
+  .val-tile .vt-k{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
+    color:var(--text-muted);margin-bottom:6px;}
+  .val-tile .vt-v{font-size:22px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;}
+  .val-tile.hero .vt-v{color:var(--accent);}
+  .val-sub{font-size:12.5px;color:var(--text-muted);margin-bottom:14px;}
+  table.valtab{width:100%;border-collapse:collapse;font-size:12.5px;background:var(--surface);
+    border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;}
+  table.valtab th{background:var(--surface-2);color:var(--text-muted);font-size:10.5px;font-weight:700;
+    text-transform:uppercase;letter-spacing:.4px;padding:9px 10px;text-align:right;white-space:nowrap;}
+  table.valtab th:first-child{text-align:left;}
+  table.valtab td{padding:8px 10px;text-align:right;border-top:1px solid var(--border);
+    color:var(--text);font-variant-numeric:tabular-nums;white-space:nowrap;}
+  table.valtab td:first-child{text-align:left;font-weight:600;}
+  table.valtab tr:hover td{background:var(--surface-2);}
+  table.valtab tr.total td{border-top:2px solid var(--border-2);font-weight:700;background:var(--surface-3);}
+  table.valtab td.dim{color:var(--text-dim);}
   /* minimized auto-annotation: floating progress pill (above everything) */
   .apw{position:fixed;right:18px;bottom:18px;width:300px;z-index:210;background:var(--surface);
     border:1px solid var(--border-2);border-radius:var(--r-lg);box-shadow:var(--sh-lg);
@@ -2154,6 +2481,11 @@ HTML = r"""<!DOCTYPE html>
         <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="11" width="3" height="6" rx="1"/><rect x="12.5" y="7" width="3" height="10" rx="1"/><rect x="18" y="13" width="3" height="4" rx="1"/></svg></div>
         <div class="hc-title">Class count</div>
         <div class="hc-desc">Count annotations per class in a CVAT project — project-wide and broken down by task.</div>
+      </div>
+      <div class="home-card val" onclick="enterVal()">
+        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6.5v5c0 4.6 3.4 8.6 8 9.5 4.6-.9 8-4.9 8-9.5v-5z"/><path d="m9 12 2 2 4-4"/></svg></div>
+        <div class="hc-title">Model validation</div>
+        <div class="hc-desc">Drop a <b>.pt</b> model and score it against a CVAT ground-truth project — precision, recall, F1, mAP. Read-only: the project is never changed.</div>
       </div>
     </div>
   </div>
@@ -2444,6 +2776,70 @@ HTML = r"""<!DOCTYPE html>
     </div>
     </div>
   </div>
+</div>
+
+<div id="valview" class="browse">
+  <div class="browse-bar">
+    <button onclick="goHome()" title="home"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/></svg></button>
+    <span class="browse-title">Model validation</span>
+    <span class="val-ro"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>read-only &mdash; the CVAT project is never modified</span>
+    <span class="spacer"></span>
+    <button id="valagain" onclick="valShowCfg()" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>New run</button>
+  </div>
+  <div class="val-page">
+    <div id="valcfg" class="modal" style="width:470px;">
+      <div class="modal-body">
+        <label>Model</label>
+        <div id="valdrop" class="dropzone" onclick="document.getElementById('valfile').click()">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5-5 5 5"/><path d="M12 5v12"/></svg>
+          <div class="dz-main">Drop a <b>.pt</b> file here</div>
+          <div class="dz-sub">or click to browse</div>
+        </div>
+        <input type="file" id="valfile" accept=".pt" style="display:none" onchange="valPickFile(this.files[0])">
+        <div id="valmodel" class="val-model" style="display:none;"></div>
+
+        <label>Ground-truth project</label>
+        <div class="selrow">
+          <select id="valproj" onchange="valLoadTasks()"><option value="">— select project —</option></select>
+          <button onclick="valLoadProjects(true)" title="refresh projects"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
+        </div>
+        <label>Tasks <span id="valtaskcount" class="aptaskcount"></span></label>
+        <div id="valtasklist" class="aptasks"><div class="apt-empty">— select a project first —</div></div>
+        <div class="aprow">
+          <button onclick="valSelectAll(true)">All</button>
+          <button onclick="valSelectAll(false)">None</button>
+        </div>
+        <div class="val-two">
+          <div><label>Confidence</label><input id="valconf" type="number" min="0" max="1" step="0.05" value="0.25"></div>
+          <div><label>IoU match</label><input id="valiou" type="number" min="0.05" max="0.95" step="0.05" value="0.5"></div>
+        </div>
+        <div id="valmsg" class="aamsg"></div>
+      </div>
+      <div class="modal-f">
+        <button id="valnext" class="ok" onclick="valNext()">Next</button>
+      </div>
+    </div>
+
+    <div id="valmapcard" class="modal" style="width:470px;display:none;">
+      <div class="modal-body">
+        <div class="maphint">Map each <b>model class</b> &rarr; a ground-truth class (auto-matched by name; <i>skip</i> to ignore):</div>
+        <div id="valmaplist"></div>
+        <div id="valmsg2" class="aamsg"></div>
+      </div>
+      <div class="modal-f">
+        <button onclick="valShowCfg()">Back</button>
+        <button id="valrun" class="ok" onclick="runValidation()">Validate</button>
+      </div>
+    </div>
+
+    <div id="valprogcard" class="modal" style="width:470px;display:none;">
+      <div class="modal-body">
+        <div class="bar indet" id="valbarwrap"><div id="valbar"></div></div>
+        <div id="valprogtext" style="font-size:13px;color:var(--text);margin-top:8px;"></div>
+      </div>
+    </div>
+  </div>
+  <div id="valresult" class="val-result" style="display:none;"></div>
 </div>
 
 <div id="confirmModal" class="modal-bg" style="z-index:400;">
@@ -2869,7 +3265,7 @@ function updateModeBadge(){
 }
 // only one full-screen surface at a time
 function hideAllScreens(){
-  ['home','cvatbrowse','ccview','apmodal'].forEach(id=>{
+  ['home','cvatbrowse','ccview','apmodal','valview'].forEach(id=>{
     const e=document.getElementById(id); if(e) e.style.display='none'; });
 }
 function enterLocal(){
@@ -4012,6 +4408,210 @@ function renderCcTable(res){
   document.getElementById('ccresult').innerHTML=h;
 }
 
+// ---- Model validation (read-only against a CVAT ground-truth project) ----
+let valPoll=null, valModel=null, valGtClasses=[], valModelClasses=[];
+function valMsg(t,el){ const e=document.getElementById(el||'valmsg'); if(e) e.textContent=t||''; }
+async function enterVal(){
+  appMode='cvat'; applyMode();
+  hideAllScreens();
+  document.getElementById('valview').style.display='flex';
+  valShowCfg();
+  valLoadProjects();
+  try{
+    const s=await fetch('/api/val/status?t='+Date.now()).then(r=>r.json());
+    if(s.running){ valShowProg(); pollValidation(); }
+    else if(s.result){ renderValResult(s.result); }
+  }catch(e){}
+}
+function valShowCfg(){
+  document.getElementById('valcfg').style.display='';
+  document.getElementById('valmapcard').style.display='none';
+  document.getElementById('valprogcard').style.display='none';
+  document.getElementById('valresult').style.display='none';
+  document.querySelector('.val-page').style.display='flex';
+  document.getElementById('valagain').style.display='none';
+  valMsg('');
+}
+function valShowMap(){
+  document.getElementById('valcfg').style.display='none';
+  document.getElementById('valmapcard').style.display='';
+  document.getElementById('valprogcard').style.display='none';
+  document.getElementById('valresult').style.display='none';
+  document.querySelector('.val-page').style.display='flex';
+}
+function valShowProg(){
+  document.getElementById('valcfg').style.display='none';
+  document.getElementById('valmapcard').style.display='none';
+  document.getElementById('valprogcard').style.display='';
+  document.getElementById('valresult').style.display='none';
+  document.querySelector('.val-page').style.display='flex';
+}
+function valShowResult(){
+  document.querySelector('.val-page').style.display='none';
+  document.getElementById('valresult').style.display='block';
+  document.getElementById('valagain').style.display='';
+}
+// ---- .pt drop zone ----
+(function(){
+  const dz=document.getElementById('valdrop'); if(!dz) return;
+  ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{
+    e.preventDefault(); e.stopPropagation(); dz.classList.add('over'); }));
+  ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{
+    e.preventDefault(); e.stopPropagation(); dz.classList.remove('over'); }));
+  dz.addEventListener('drop',e=>{ const f=e.dataTransfer.files && e.dataTransfer.files[0]; if(f) valPickFile(f); });
+})();
+async function valPickFile(f){
+  if(!f) return;
+  if(!f.name.toLowerCase().endsWith('.pt')){ valMsg('that is not a .pt file'); return; }
+  valMsg('uploading '+f.name+'…');
+  const fd=new FormData(); fd.append('model', f);
+  try{
+    const r=await fetch('/api/val/upload_model',{method:'POST',body:fd}).then(r=>r.json());
+    if(r.error){ valMsg('upload failed: '+r.error); return; }
+    valModel={path:r.path, name:r.name};
+    const box=document.getElementById('valmodel');
+    box.innerHTML='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ok);flex:none;"><polyline points="20 6 9 17 4 12"/></svg>'
+      +'<span class="vm-name">'+escapeHtml(r.name)+'</span>'
+      +'<span class="vm-size">'+(r.size/1048576).toFixed(1)+' MB</span>';
+    box.style.display='flex';
+    valMsg('');
+  }catch(e){ valMsg('upload failed'); }
+}
+async function valLoadProjects(refresh){
+  const sel=document.getElementById('valproj'); const prev=sel.value;
+  sel.innerHTML='<option value="">loading…</option>';
+  try{
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
+    if(r.error){ sel.innerHTML='<option value="">— error —</option>'; valMsg('error: '+r.error); return; }
+    sel.innerHTML='<option value="">— select project —</option>'
+      +r.projects.map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
+    if(prev) sel.value=prev;
+    syncDD(sel);
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; }
+}
+async function valLoadTasks(){
+  const pid=document.getElementById('valproj').value;
+  const host=document.getElementById('valtasklist');
+  valGtClasses=[];
+  if(!pid){ host.innerHTML='<div class="apt-empty">— select a project first —</div>'; valTaskCount(); return; }
+  host.innerHTML='<div class="apt-empty">loading tasks…</div>';
+  try{
+    const [t,l]=await Promise.all([
+      fetch('/api/cvat/tasks?project_id='+encodeURIComponent(pid)+'&t='+Date.now()).then(r=>r.json()),
+      fetch('/api/cvat/projectlabels?project_id='+encodeURIComponent(pid)+'&t='+Date.now()).then(r=>r.json())
+    ]);
+    valGtClasses=l.classes||[];
+    if(t.error){ host.innerHTML='<div class="apt-empty">error: '+escapeHtml(t.error)+'</div>'; return; }
+    if(!t.tasks.length){ host.innerHTML='<div class="apt-empty">no tasks in this project</div>'; return; }
+    host.innerHTML=t.tasks.map(x=>'<label class="trow"><input type="checkbox" checked value="'+x.id
+      +'" onchange="valTaskCount()"><span class="tid">#'+x.id+'</span><span class="tname">'
+      +escapeHtml(x.name)+(x.size!=null?(' · '+x.size+' imgs'):'')+'</span></label>').join('');
+    valTaskCount();
+    valMsg(valGtClasses.length+' ground-truth classes');
+  }catch(e){ host.innerHTML='<div class="apt-empty">failed to load tasks</div>'; }
+}
+function valTaskCount(){
+  const n=document.querySelectorAll('#valtasklist input:checked').length;
+  const e=document.getElementById('valtaskcount'); if(e) e.textContent=n?('· '+n+' selected'):'';
+}
+function valSelectAll(on){
+  document.querySelectorAll('#valtasklist input[type=checkbox]').forEach(c=>c.checked=on);
+  valTaskCount();
+}
+function valCheckedTasks(){
+  return [...document.querySelectorAll('#valtasklist input:checked')].map(c=>parseInt(c.value,10));
+}
+async function valNext(){
+  if(!valModel){ valMsg('drop a .pt model first'); return; }
+  if(!document.getElementById('valproj').value){ valMsg('select a ground-truth project'); return; }
+  if(!valCheckedTasks().length){ valMsg('select at least one task'); return; }
+  if(!valGtClasses.length){ valMsg('this project has no labels'); return; }
+  valMsg('reading model classes…');
+  try{
+    const r=await fetch('/api/modelclasses?model='+encodeURIComponent(valModel.path)
+      +'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ valMsg('error: '+r.error); return; }
+    valModelClasses=r.classes||[];
+    if(!valModelClasses.length){ valMsg('model exposes no classes'); return; }
+    buildValMap(); valMsg(''); valShowMap();
+  }catch(e){ valMsg('failed to read model classes'); }
+}
+function buildValMap(){
+  const host=document.getElementById('valmaplist');
+  const lower={}; valGtClasses.forEach((n,i)=>{ lower[String(n).trim().toLowerCase()]=i; });
+  const opts=(sel)=>'<option value="">— skip —</option>'
+    + valGtClasses.map((n,i)=>'<option value="'+i+'"'+(i===sel?' selected':'')+'>'
+        +i+': '+escapeHtml(n)+'</option>').join('');
+  host.innerHTML=valModelClasses.map((mn,mi)=>{
+    const m=lower[String(mn).trim().toLowerCase()];
+    return '<div class="maprow"><span class="mc" title="'+escapeHtml(mn)+'">'+mi+': '+escapeHtml(mn)
+      +'</span><span class="arr">→</span><select data-mi="'+mi+'">'
+      +opts(m===undefined?-1:m)+'</select></div>';
+  }).join('');
+  host.querySelectorAll('select').forEach(enhanceSelect);
+}
+async function runValidation(){
+  const mapping={};
+  document.querySelectorAll('#valmaplist select').forEach(s=>{
+    if(s.value!=='') mapping[s.getAttribute('data-mi')]=parseInt(s.value,10);
+  });
+  if(!Object.keys(mapping).length){ valMsg('map at least one class','valmsg2'); return; }
+  const body={ model:valModel.path, project_id:document.getElementById('valproj').value,
+    task_ids:valCheckedTasks(), classes:valGtClasses, mapping,
+    conf:parseFloat(document.getElementById('valconf').value)||0.25,
+    iou:parseFloat(document.getElementById('valiou').value)||0.5 };
+  valMsg('','valmsg2'); valShowProg();
+  document.getElementById('valprogtext').textContent='starting…';
+  try{
+    const r=await fetch('/api/val/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}).then(r=>r.json());
+    if(r.error){ document.getElementById('valprogtext').textContent='error: '+r.error; return; }
+    pollValidation();
+  }catch(e){ document.getElementById('valprogtext').textContent='request failed'; }
+}
+function pollValidation(){
+  clearInterval(valPoll);
+  valPoll=setInterval(async()=>{
+    let s; try{ s=await fetch('/api/val/status?t='+Date.now()).then(r=>r.json()); }catch(e){ return; }
+    let t=s.message||s.state||'';
+    if(s.running && s.total) t+=' ('+s.done+'/'+s.total+')';
+    document.getElementById('valprogtext').textContent=t;
+    if(!s.running){
+      clearInterval(valPoll);
+      if(s.error) return;                       // leave the error shown
+      if(s.result) renderValResult(s.result);
+    }
+  }, 1000);
+}
+function pct(x){ return (x*100).toFixed(1)+'%'; }
+function renderValResult(res){
+  const o=res.overall||{};
+  let h='<div class="val-tiles">'
+    +'<div class="val-tile hero"><div class="vt-k">mAP@50</div><div class="vt-v">'+(o.map50||0).toFixed(3)+'</div></div>'
+    +'<div class="val-tile"><div class="vt-k">Precision</div><div class="vt-v">'+pct(o.precision||0)+'</div></div>'
+    +'<div class="val-tile"><div class="vt-k">Recall</div><div class="vt-v">'+pct(o.recall||0)+'</div></div>'
+    +'<div class="val-tile"><div class="vt-k">F1</div><div class="vt-v">'+pct(o.f1||0)+'</div></div>'
+    +'<div class="val-tile"><div class="vt-k">Images</div><div class="vt-v">'+(res.images||0)+'</div></div>'
+    +'<div class="val-tile"><div class="vt-k">TP / FP / FN</div><div class="vt-v" style="font-size:16px;">'
+      +(o.tp||0)+' / '+(o.fp||0)+' / '+(o.fn||0)+'</div></div>'
+    +'</div>';
+  h+='<div class="val-sub">'+escapeHtml(res.model||'')+' &nbsp;·&nbsp; project '+escapeHtml(String(res.project_id||''))
+    +' &nbsp;·&nbsp; '+(res.tasks||0)+' task(s) &nbsp;·&nbsp; conf &ge; '+res.conf+' &nbsp;·&nbsp; IoU &ge; '+res.iou
+    +' &nbsp;·&nbsp; ground truth was only read, never modified</div>';
+  h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th><th>TP</th><th>FP</th><th>FN</th>'
+    +'<th>Precision</th><th>Recall</th><th>F1</th><th>AP@50</th></tr></thead><tbody>';
+  (res.per_class||[]).forEach(c=>{
+    const dim = c.gt ? '' : ' class="dim"';
+    h+='<tr><td>'+escapeHtml(c.name)+'</td><td'+dim+'>'+c.gt+'</td><td>'+c.tp+'</td><td>'+c.fp+'</td><td>'+c.fn+'</td>'
+      +'<td>'+pct(c.precision)+'</td><td>'+pct(c.recall)+'</td><td>'+pct(c.f1)+'</td><td>'+c.ap50.toFixed(3)+'</td></tr>';
+  });
+  h+='<tr class="total"><td>ALL</td><td>'+(o.gt||0)+'</td><td>'+(o.tp||0)+'</td><td>'+(o.fp||0)+'</td><td>'+(o.fn||0)+'</td>'
+    +'<td>'+pct(o.precision||0)+'</td><td>'+pct(o.recall||0)+'</td><td>'+pct(o.f1||0)+'</td><td>'+(o.map50||0).toFixed(3)+'</td></tr>';
+  h+='</tbody></table>';
+  document.getElementById('valresult').innerHTML=h;
+  valShowResult();
+}
+
 async function saveIfDirty(){
   if(touched){
     if(document.getElementById('autosave').checked) await save();
@@ -4235,7 +4835,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   updateThemeIcons();          // set the light/dark toggle icons
   showContinueCard(m);         // offer to resume the last session from the home page
   enhanceSelects(['classsel','cvatproj','aamode','apmodel',
-                  'approj','apmode','cvUploadProj','ccproj','clsproj']);  // styled dropdowns
+                  'approj','apmode','cvUploadProj','ccproj','clsproj','valproj']);  // styled dropdowns
   loadCvatProjects();          // populate the CVAT project dropdown in the background
   if(!count){ setStatus('no images in '+(m.path||'')+' — set a folder above'); return; }
   load(startIdx);

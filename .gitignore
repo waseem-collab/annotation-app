@@ -6,3 +6,5 @@ dataset/
 .annotation_app_state
 __pycache__/
 *.pyc
+imports/
+validation/
