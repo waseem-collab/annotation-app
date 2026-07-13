@@ -1797,8 +1797,33 @@ def _average_precision(dets, n_gt):
 
 
 _val_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
-            "cur_task": 0, "n_tasks": 0, "result": None, "error": None}
+            "cur_task": 0, "n_tasks": 0, "result": None, "error": None,
+            "config": None, "finished_at": None}
 _val_lock = threading.Lock()
+
+# the last completed run (config + result) is kept on disk so it survives a restart
+VAL_LAST_FILE = os.path.join(BASE, ".val_last.json")
+
+
+def _save_val_last(config, result, finished_at):
+    try:
+        with open(VAL_LAST_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"config": config, "result": result,
+                       "finished_at": finished_at}, fh)
+    except OSError:
+        pass
+
+
+def _load_val_last():
+    try:
+        with open(VAL_LAST_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if d.get("result"):
+        _val_job.update(result=d["result"], config=d.get("config"),
+                        finished_at=d.get("finished_at"), state="done",
+                        message="last run (restored)")
 
 VAL_INFER_CONF = 0.01      # infer low so the PR curve (AP) is meaningful
 
@@ -1808,7 +1833,7 @@ def _set_val(**kw):
         _val_job.update(kw)
 
 
-def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mapping):
+def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mapping, config=None):
     """Run the model over the project's ground truth and score it. Read-only."""
     try:
         n_cls = len(classes)
@@ -1912,9 +1937,13 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                   "images": n_images, "tasks": len(task_ids),
                   "conf": conf, "iou": iou_thr,
                   "model": os.path.basename(model_path), "project_id": project_id}
-        _set_val(running=False, state="done", result=result,
+        import time
+        finished_at = time.strftime("%Y-%m-%d %H:%M")
+        _set_val(running=False, state="done", result=result, config=config,
+                 finished_at=finished_at,
                  message=f"done ✓ — {n_images} images, mAP@50 "
                          f"{(sum_ap/n_present if n_present else 0):.3f}")
+        _save_val_last(config, result, finished_at)     # survives a restart
     except Exception as e:
         _set_val(running=False, state="error", error=str(e), message=f"validation failed: {e}")
 
@@ -1962,13 +1991,20 @@ def api_val_run():
     mapping = _parse_mapping(data.get("mapping"))
     if not mapping:
         return jsonify({"error": "map at least one model class"}), 400
+    # everything needed to reproduce/pre-fill this run next time
+    config = {"model": data.get("model"), "model_name": os.path.basename(model_path),
+              "project_id": project_id, "task_ids": task_ids, "classes": list(classes),
+              "conf": conf, "iou": iou_thr,
+              "mapping": {str(k): v for k, v in mapping.items()}}
     with _val_lock:
         if _val_job["running"]:
             return jsonify({"error": "a validation is already running"}), 409
         _val_job.update(running=True, state="starting", message="starting…", done=0,
-                        total=0, cur_task=0, n_tasks=len(task_ids), result=None, error=None)
+                        total=0, cur_task=0, n_tasks=len(task_ids), result=None,
+                        error=None, config=config, finished_at=None)
     threading.Thread(target=_do_validate,
-                     args=(model_path, project_id, task_ids, list(classes), conf, iou_thr, mapping),
+                     args=(model_path, project_id, task_ids, list(classes), conf, iou_thr,
+                           mapping, config),
                      daemon=True).start()
     return jsonify({"started": True, "tasks": len(task_ids)})
 
@@ -1977,6 +2013,9 @@ def api_val_run():
 def api_val_status():
     with _val_lock:
         return jsonify(dict(_val_job))
+
+
+_load_val_last()          # restore the last completed run on startup
 
 
 @app.route("/")
@@ -4409,18 +4448,39 @@ function renderCcTable(res){
 }
 
 // ---- Model validation (read-only against a CVAT ground-truth project) ----
-let valPoll=null, valModel=null, valGtClasses=[], valModelClasses=[];
+let valPoll=null, valModel=null, valGtClasses=[], valModelClasses=[], valLastConfig=null;
 function valMsg(t,el){ const e=document.getElementById(el||'valmsg'); if(e) e.textContent=t||''; }
 async function enterVal(){
   appMode='cvat'; applyMode();
   hideAllScreens();
   document.getElementById('valview').style.display='flex';
   valShowCfg();
-  valLoadProjects();
+  await valLoadProjects();
+  let s=null;
+  try{ s=await fetch('/api/val/status?t='+Date.now()).then(r=>r.json()); }catch(e){}
+  if(!s) return;
+  if(s.config){ valLastConfig=s.config; await valPrefill(s.config); }   // remember last run's settings
+  if(s.running){ valShowProg(); pollValidation(); }
+  else if(s.result){ renderValResult(s.result, s.finished_at); }        // and its results
+}
+// restore the previous run's model / project / tasks / thresholds into the form
+async function valPrefill(cfg){
   try{
-    const s=await fetch('/api/val/status?t='+Date.now()).then(r=>r.json());
-    if(s.running){ valShowProg(); pollValidation(); }
-    else if(s.result){ renderValResult(s.result); }
+    valModel={path:cfg.model, name:cfg.model_name};
+    const b=document.getElementById('valmodel');
+    b.innerHTML='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ok);flex:none;"><polyline points="20 6 9 17 4 12"/></svg>'
+      +'<span class="vm-name">'+escapeHtml(cfg.model_name||'')+'</span>'
+      +'<span class="vm-size">last used</span>';
+    b.style.display='flex';
+    if(cfg.conf!=null) document.getElementById('valconf').value=cfg.conf;
+    if(cfg.iou!=null) document.getElementById('valiou').value=cfg.iou;
+    const sel=document.getElementById('valproj');
+    sel.value=String(cfg.project_id); syncDD(sel);
+    if(!sel.value) return;                       // project no longer in the list
+    await valLoadTasks();
+    const ids=new Set((cfg.task_ids||[]).map(String));
+    document.querySelectorAll('#valtasklist input[type=checkbox]').forEach(c=>{ c.checked=ids.has(c.value); });
+    valTaskCount();
   }catch(e){}
 }
 function valShowCfg(){
@@ -4539,14 +4599,18 @@ async function valNext(){
 function buildValMap(){
   const host=document.getElementById('valmaplist');
   const lower={}; valGtClasses.forEach((n,i)=>{ lower[String(n).trim().toLowerCase()]=i; });
+  // reuse the previous run's mapping when it was the same model
+  const saved = (valLastConfig && valLastConfig.model===valModel.path && valLastConfig.mapping) || {};
   const opts=(sel)=>'<option value="">— skip —</option>'
     + valGtClasses.map((n,i)=>'<option value="'+i+'"'+(i===sel?' selected':'')+'>'
         +i+': '+escapeHtml(n)+'</option>').join('');
   host.innerHTML=valModelClasses.map((mn,mi)=>{
-    const m=lower[String(mn).trim().toLowerCase()];
+    const pre = saved[String(mi)];
+    const auto = lower[String(mn).trim().toLowerCase()];
+    const chosen = (pre!==undefined) ? pre : (auto===undefined ? -1 : auto);
     return '<div class="maprow"><span class="mc" title="'+escapeHtml(mn)+'">'+mi+': '+escapeHtml(mn)
       +'</span><span class="arr">→</span><select data-mi="'+mi+'">'
-      +opts(m===undefined?-1:m)+'</select></div>';
+      +opts(chosen)+'</select></div>';
   }).join('');
   host.querySelectorAll('select').forEach(enhanceSelect);
 }
@@ -4579,12 +4643,13 @@ function pollValidation(){
     if(!s.running){
       clearInterval(valPoll);
       if(s.error) return;                       // leave the error shown
-      if(s.result) renderValResult(s.result);
+      if(s.config) valLastConfig=s.config;
+      if(s.result) renderValResult(s.result, s.finished_at);
     }
   }, 1000);
 }
 function pct(x){ return (x*100).toFixed(1)+'%'; }
-function renderValResult(res){
+function renderValResult(res, finishedAt){
   const o=res.overall||{};
   let h='<div class="val-tiles">'
     +'<div class="val-tile hero"><div class="vt-k">mAP@50</div><div class="vt-v">'+(o.map50||0).toFixed(3)+'</div></div>'
@@ -4597,6 +4662,7 @@ function renderValResult(res){
     +'</div>';
   h+='<div class="val-sub">'+escapeHtml(res.model||'')+' &nbsp;·&nbsp; project '+escapeHtml(String(res.project_id||''))
     +' &nbsp;·&nbsp; '+(res.tasks||0)+' task(s) &nbsp;·&nbsp; conf &ge; '+res.conf+' &nbsp;·&nbsp; IoU &ge; '+res.iou
+    +(finishedAt?(' &nbsp;·&nbsp; <b>last run '+escapeHtml(finishedAt)+'</b>'):'')
     +' &nbsp;·&nbsp; ground truth was only read, never modified</div>';
   h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th><th>TP</th><th>FP</th><th>FN</th>'
     +'<th>Precision</th><th>Recall</th><th>F1</th><th>AP@50</th></tr></thead><tbody>';
