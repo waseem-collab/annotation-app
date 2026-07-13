@@ -1912,146 +1912,424 @@ def _set_val(**kw):
         _val_job.update(kw)
 
 
+def _prepare_gt(task_ids, classes, say=None):
+    """Download (read-only) and index the ground truth ONCE, as a flat list of images
+    with their GT boxes. Shared by validation and comparison, so two models are always
+    scored against byte-identical data."""
+    n = len(task_ids)
+    lower = {str(x).strip().lower(): i for i, x in enumerate(classes)}
+    items = []
+    for ti, tid in enumerate(task_ids, 1):
+        if say:
+            say(f"task {ti}/{n}: fetching ground truth…")
+        d = _val_fetch_task(tid, status=(lambda m: say(f"[{ti}/{n}] {m}")) if say else None)
+        img_dir, lbl_dir = os.path.join(d, "images"), os.path.join(d, "labels")
+        gt_to_proj = {}
+        for gi, gn in enumerate(_classes_in(d)):
+            pi = lower.get(str(gn).strip().lower())
+            if pi is not None:
+                gt_to_proj[gi] = pi
+        for img in (sorted(os.listdir(img_dir)) if os.path.isdir(img_dir) else []):
+            stem = os.path.splitext(img)[0]
+            gts = []
+            for b in _read_label_file(os.path.join(lbl_dir, stem + ".txt")):
+                ci = gt_to_proj.get(int(b["cls"]))
+                if ci is None:
+                    continue
+                gts.append({"cls": ci, "cx": b["cx"], "cy": b["cy"],
+                            "w": b["w"], "h": b["h"]})
+            full = os.path.join(img_dir, img)
+            items.append({"img": img, "path": full,
+                          "rel": os.path.relpath(full, VAL_DIR), "gts": gts})
+    return items
+
+
+def _assemble_metrics(classes, gt_count, tp, fp, det_pool):
+    per_class, sum_ap, n_present = [], 0.0, 0
+    for ci in range(len(classes)):
+        fn = max(0, gt_count[ci] - tp[ci])
+        prec = tp[ci] / (tp[ci] + fp[ci]) if (tp[ci] + fp[ci]) else 0.0
+        rec = tp[ci] / gt_count[ci] if gt_count[ci] else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+        denom = tp[ci] + fp[ci] + fn
+        acc = tp[ci] / denom if denom else 0.0
+        ap = _average_precision(det_pool[ci], gt_count[ci])
+        if gt_count[ci]:
+            sum_ap += ap
+            n_present += 1
+        per_class.append({"name": classes[ci], "gt": gt_count[ci], "tp": tp[ci],
+                          "fp": fp[ci], "fn": fn, "precision": prec, "recall": rec,
+                          "f1": f1, "accuracy": acc, "ap50": ap})
+    TP, FP = sum(tp), sum(fp)
+    GT = sum(gt_count)
+    FN = max(0, GT - TP)
+    P = TP / (TP + FP) if (TP + FP) else 0.0
+    R = TP / GT if GT else 0.0
+    F1 = (2 * P * R / (P + R)) if (P + R) else 0.0
+    ACC = TP / (TP + FP + FN) if (TP + FP + FN) else 0.0
+    return {"classes": classes, "per_class": per_class,
+            "overall": {"gt": GT, "tp": TP, "fp": FP, "fn": FN, "precision": P,
+                        "recall": R, "f1": F1, "accuracy": ACC,
+                        "map50": (sum_ap / n_present) if n_present else 0.0}}
+
+
+def _score_model(model_path, mapping, items, classes, conf, iou_thr, contain, tick=None):
+    """Run ONE model over the prepared ground truth.
+    Returns (metrics, per_image, ms_per_image). per_image[i] lines up with items[i]."""
+    import time
+    n_cls = len(classes)
+    gt_count = [0] * n_cls
+    tp = [0] * n_cls
+    fp = [0] * n_cls
+    det_pool = [[] for _ in range(n_cls)]
+    per_image = []
+    _load_model(model_path)
+    t_infer, n_images = 0.0, 0
+    r5 = lambda v: round(float(v), 5)
+    for k, it in enumerate(items):
+        if tick and k % 5 == 0:
+            tick(k, len(items))
+        gts = [dict(g) for g in it["gts"]]        # match flags are per-model
+        for g in gts:
+            gt_count[g["cls"]] += 1
+        try:
+            t0 = time.perf_counter()
+            dets, _ = _infer(model_path, it["path"], VAL_INFER_CONF)
+            t_infer += time.perf_counter() - t0
+            n_images += 1
+        except Exception:                          # keep the lists aligned
+            per_image.append({"p": it["rel"], "n": it["img"],
+                              "gtm": [0] * len(gts), "pd": []})
+            continue
+        preds = []
+        for dt in dets:
+            ci = mapping.get(dt.get("cls_model"))
+            if ci is None or not (0 <= ci < n_cls):
+                continue
+            preds.append({"cls": ci, "conf": dt["conf"], "cx": dt["cx"],
+                          "cy": dt["cy"], "w": dt["w"], "h": dt["h"]})
+        for ci in range(n_cls):
+            g = [x for x in gts if x["cls"] == ci]
+            p = sorted([x for x in preds if x["cls"] == ci], key=lambda x: -x["conf"])
+            used = [False] * len(g)
+            for pr in p:
+                best, best_j = -1.0, -1
+                for j, gb in enumerate(g):
+                    if used[j]:
+                        continue
+                    v = _iou(pr, gb)
+                    ok = v >= iou_thr or (contain and _contained(pr, gb))
+                    if ok and v > best:
+                        best, best_j = v, j
+                is_tp = best_j >= 0
+                pr["tp"] = bool(is_tp)
+                if is_tp:
+                    used[best_j] = True
+                    if pr["conf"] >= conf:
+                        g[best_j]["m"] = True
+                det_pool[ci].append((pr["conf"], is_tp))
+                if pr["conf"] >= conf:
+                    if is_tp:
+                        tp[ci] += 1
+                    else:
+                        fp[ci] += 1
+        per_image.append({
+            "p": it["rel"], "n": it["img"],
+            "gtm": [1 if g.get("m") else 0 for g in gts],
+            "pd": [[b["cls"], r5(b["cx"]), r5(b["cy"]), r5(b["w"]), r5(b["h"]),
+                    round(float(b["conf"]), 3), 1 if b.get("tp") else 0]
+                   for b in preds if b["conf"] >= conf],
+        })
+    m = _assemble_metrics(classes, gt_count, tp, fp, det_pool)
+    m["images"] = n_images
+    return m, per_image, ((t_infer * 1000.0 / n_images) if n_images else 0.0)
+
+
 def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mapping,
                  contain=True, config=None):
-    """Run the model over the project's ground truth and score it. Read-only."""
     try:
-        n_cls = len(classes)
-        gt_count = [0] * n_cls
-        tp = [0] * n_cls
-        fp = [0] * n_cls
-        det_pool = [[] for _ in range(n_cls)]     # (conf, is_tp) for AP
-        details = []                              # per-image boxes for the class viewer
-        n_images = 0
-        _set_val(state="loading", message="loading model…", n_tasks=len(task_ids))
-        _load_model(model_path)
-        for ti, tid in enumerate(task_ids, 1):
-            _set_val(cur_task=ti, message=f"task {ti}/{len(task_ids)}: fetching ground truth…")
-            d = _val_fetch_task(tid, status=lambda m: _set_val(message=f"[{ti}/{len(task_ids)}] {m}"))
-            img_dir = os.path.join(d, "images")
-            lbl_dir = os.path.join(d, "labels")
-            gt_classes = _classes_in(d)           # this task's label order
-            # map this task's GT class index -> our project class index (by name)
-            gt_to_proj = {}
-            lower = {str(n).strip().lower(): i for i, n in enumerate(classes)}
-            for gi, gn in enumerate(gt_classes):
-                pi = lower.get(str(gn).strip().lower())
-                if pi is not None:
-                    gt_to_proj[gi] = pi
-            images = sorted(os.listdir(img_dir)) if os.path.isdir(img_dir) else []
-            _set_val(total=len(images), done=0)
-            for i, img in enumerate(images):
-                if i % 5 == 0:
-                    _set_val(done=i, message=f"task {ti}/{len(task_ids)}: scoring {i+1}/{len(images)}…")
-                stem = os.path.splitext(img)[0]
-                # ---- ground truth for this image
-                gts = []
-                for b in _read_label_file(os.path.join(lbl_dir, stem + ".txt")):
-                    ci = gt_to_proj.get(int(b["cls"]))
-                    if ci is None:
-                        continue
-                    gts.append({"cls": ci, "cx": b["cx"], "cy": b["cy"], "w": b["w"], "h": b["h"]})
-                    gt_count[ci] += 1
-                # ---- predictions
-                try:
-                    dets, _ = _infer(model_path, os.path.join(img_dir, img), VAL_INFER_CONF)
-                except Exception:
-                    continue
-                preds = []
-                for dt in dets:
-                    ci = mapping.get(dt.get("cls_model"))
-                    if ci is None or not (0 <= ci < n_cls):
-                        continue
-                    preds.append({"cls": ci, "conf": dt["conf"], "cx": dt["cx"],
-                                  "cy": dt["cy"], "w": dt["w"], "h": dt["h"]})
-                n_images += 1
-                # ---- greedy match per class (highest confidence first)
-                for ci in range(n_cls):
-                    g = [x for x in gts if x["cls"] == ci]
-                    p = sorted([x for x in preds if x["cls"] == ci],
-                               key=lambda x: -x["conf"])
-                    used = [False] * len(g)
-                    for pr in p:
-                        # a GT qualifies on IoU, or (optionally) if one box fully
-                        # contains the other; among qualifiers take the best IoU
-                        best, best_j = -1.0, -1
-                        for j, gb in enumerate(g):
-                            if used[j]:
-                                continue
-                            v = _iou(pr, gb)
-                            ok = v >= iou_thr or (contain and _contained(pr, gb))
-                            if ok and v > best:
-                                best, best_j = v, j
-                        is_tp = best_j >= 0
-                        pr["tp"] = bool(is_tp)
-                        if is_tp:
-                            used[best_j] = True
-                            if pr["conf"] >= conf:
-                                g[best_j]["m"] = True       # GT matched at the threshold
-                        det_pool[ci].append((pr["conf"], is_tp))       # for AP (all conf)
-                        if pr["conf"] >= conf:                          # threshold metrics
-                            if is_tp:
-                                tp[ci] += 1
-                            else:
-                                fp[ci] += 1
-                # ---- keep per-image detail so the class viewer can show the boxes
-                r5 = lambda v: round(float(v), 5)
-                rec_gt = [[b["cls"], r5(b["cx"]), r5(b["cy"]), r5(b["w"]), r5(b["h"]),
-                           1 if b.get("m") else 0] for b in gts]
-                rec_pd = [[b["cls"], r5(b["cx"]), r5(b["cy"]), r5(b["w"]), r5(b["h"]),
-                           round(float(b["conf"]), 3), 1 if b.get("tp") else 0]
-                          for b in preds if b["conf"] >= conf]
-                if rec_gt or rec_pd:
-                    details.append({"p": os.path.relpath(os.path.join(img_dir, img), VAL_DIR),
-                                    "n": img, "gt": rec_gt, "pd": rec_pd})
-            _set_val(done=len(images))
-        # ---- assemble metrics
-        per_class, sum_ap, n_present = [], 0.0, 0
-        for ci in range(n_cls):
-            # TPs at the threshold are counted above; FN = GT not matched at threshold
-            matched = tp[ci]
-            fn = max(0, gt_count[ci] - matched)
-            prec = tp[ci] / (tp[ci] + fp[ci]) if (tp[ci] + fp[ci]) else 0.0
-            rec = matched / gt_count[ci] if gt_count[ci] else 0.0
-            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
-            # detection "accuracy": correct hits over everything that happened.
-            # (There are no true negatives to count in detection, so TP/(TP+FP+FN).)
-            denom = tp[ci] + fp[ci] + fn
-            accuracy = tp[ci] / denom if denom else 0.0
-            ap = _average_precision(det_pool[ci], gt_count[ci])
-            if gt_count[ci]:
-                sum_ap += ap
-                n_present += 1
-            per_class.append({"name": classes[ci], "gt": gt_count[ci], "tp": tp[ci],
-                              "fp": fp[ci], "fn": fn, "precision": prec, "recall": rec,
-                              "f1": f1, "accuracy": accuracy, "ap50": ap})
-        TP, FP = sum(tp), sum(fp)
-        GT = sum(gt_count)
-        FN = max(0, GT - TP)
-        P = TP / (TP + FP) if (TP + FP) else 0.0
-        R = TP / GT if GT else 0.0
-        F1 = (2 * P * R / (P + R)) if (P + R) else 0.0
-        ACC = TP / (TP + FP + FN) if (TP + FP + FN) else 0.0
-        result = {"classes": classes, "per_class": per_class,
-                  "overall": {"gt": GT, "tp": TP, "fp": FP, "fn": FN,
-                              "precision": P, "recall": R, "f1": F1, "accuracy": ACC,
-                              "map50": (sum_ap / n_present) if n_present else 0.0},
-                  "images": n_images, "tasks": len(task_ids),
-                  "conf": conf, "iou": iou_thr, "contain": bool(contain),
-                  "model": (config or {}).get("model_name") or os.path.basename(model_path),
-                  "name": (config or {}).get("name") or "",
-                  "model_file": os.path.basename(model_path), "project_id": project_id}
+        _set_val(state="loading", message="fetching ground truth…", n_tasks=len(task_ids))
+        items = _prepare_gt(task_ids, classes, say=lambda m: _set_val(message=m))
+        _set_val(state="scoring", total=len(items), done=0, message="loading model…")
+        m, per_image, ms = _score_model(
+            model_path, mapping, items, classes, conf, iou_thr, contain,
+            tick=lambda k, n: _set_val(done=k, message=f"scoring {k+1}/{n}…"))
+        r5 = lambda v: round(float(v), 5)
+        details = []
+        for it, pi in zip(items, per_image):
+            gt = [[g["cls"], r5(g["cx"]), r5(g["cy"]), r5(g["w"]), r5(g["h"]), pi["gtm"][j]]
+                  for j, g in enumerate(it["gts"])]
+            if gt or pi["pd"]:
+                details.append({"p": pi["p"], "n": pi["n"], "gt": gt, "pd": pi["pd"]})
+        result = dict(m)
+        result.update({"tasks": len(task_ids), "conf": conf, "iou": iou_thr,
+                       "contain": bool(contain), "ms_per_image": round(ms, 1),
+                       "model": (config or {}).get("model_name") or os.path.basename(model_path),
+                       "name": (config or {}).get("name") or "",
+                       "model_file": os.path.basename(model_path),
+                       "project_id": project_id})
         import time
         finished_at = time.strftime("%Y-%m-%d %H:%M")
         run_id = str(int(time.time() * 1000))
-        _save_val_details(run_id, details)         # boxes for the per-class image viewer
+        _save_val_details(run_id, details)
+        mp = result["overall"]["map50"]
         _set_val(running=False, state="done", result=result, config=config,
                  finished_at=finished_at, run_id=run_id,
-                 message=f"done ✓ — {n_images} images, mAP@50 "
-                         f"{(sum_ap/n_present if n_present else 0):.3f}")
-        _append_val_history(run_id, config, result, finished_at)   # keep in history
+                 message=f"done ✓ — {result['images']} images, mAP@50 {mp:.3f}")
+        _append_val_history(run_id, config, result, finished_at)
     except Exception as e:
         _set_val(running=False, state="error", error=str(e), message=f"validation failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Model comparison: score TWO models on the same ground truth, head to head.
+# Same read-only guarantee — the CVAT project is only ever exported.
+# --------------------------------------------------------------------------- #
+_cmp_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
+            "n_tasks": 0, "result": None, "error": None, "config": None,
+            "finished_at": None, "run_id": None}
+_cmp_lock = threading.Lock()
+CMP_HIST_FILE = os.path.join(BASE, ".cmp_history.json")
+
+
+def _set_cmp(**kw):
+    with _cmp_lock:
+        _cmp_job.update(kw)
+
+
+def _cmp_details_path(run_id):
+    return os.path.join(VAL_DIR, "cmp_runs", f"{_safe_name(str(run_id))}.json")
+
+
+def _load_cmp_history():
+    if not os.path.exists(CMP_HIST_FILE):
+        return []
+    try:
+        with open(CMP_HIST_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if isinstance(d, list):
+            return d
+        raise ValueError("not a list")
+    except (OSError, ValueError):
+        try:
+            bad = CMP_HIST_FILE + ".corrupt"
+            if not os.path.exists(bad):
+                os.replace(CMP_HIST_FILE, bad)
+        except OSError:
+            pass
+        return []
+
+
+def _save_cmp_history(hist):
+    try:
+        tmp = CMP_HIST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(hist[:VAL_HIST_MAX], fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CMP_HIST_FILE)
+    except OSError:
+        pass
+
+
+def _do_compare(mp_a, mp_b, project_id, task_ids, classes, conf, iou_thr,
+                map_a, map_b, contain=True, config=None):
+    try:
+        _set_cmp(state="loading", message="fetching ground truth…", n_tasks=len(task_ids))
+        items = _prepare_gt(task_ids, classes, say=lambda m: _set_cmp(message=m))
+        N = len(items)
+        _set_cmp(state="scoring", total=N * 2, done=0)
+        ma, pia, ms_a = _score_model(
+            mp_a, map_a, items, classes, conf, iou_thr, contain,
+            tick=lambda k, n: _set_cmp(done=k, message=f"model A: {k+1}/{n}…"))
+        mb, pib, ms_b = _score_model(
+            mp_b, map_b, items, classes, conf, iou_thr, contain,
+            tick=lambda k, n: _set_cmp(done=N + k, message=f"model B: {k+1}/{n}…"))
+
+        # ---- agreement over every ground-truth object: who found what?
+        both = only_a = only_b = neither = 0
+        for j, it in enumerate(items):
+            for gi in range(len(it["gts"])):
+                a, b = pia[j]["gtm"][gi], pib[j]["gtm"][gi]
+                if a and b:
+                    both += 1
+                elif a:
+                    only_a += 1
+                elif b:
+                    only_b += 1
+                else:
+                    neither += 1
+
+        # ---- per-image boxes for the 3-panel viewer (GT | A | B)
+        r5 = lambda v: round(float(v), 5)
+        details = []
+        for j, it in enumerate(items):
+            gt = [[g["cls"], r5(g["cx"]), r5(g["cy"]), r5(g["w"]), r5(g["h"]),
+                   pia[j]["gtm"][gi], pib[j]["gtm"][gi]] for gi, g in enumerate(it["gts"])]
+            if gt or pia[j]["pd"] or pib[j]["pd"]:
+                details.append({"p": pia[j]["p"], "n": pia[j]["n"], "gt": gt,
+                                "a": pia[j]["pd"], "b": pib[j]["pd"]})
+        try:
+            os.makedirs(os.path.join(VAL_DIR, "cmp_runs"), exist_ok=True)
+        except OSError:
+            pass
+
+        cfg = config or {}
+        a_res = dict(ma)
+        a_res.update({"model": cfg.get("model_a_name") or os.path.basename(mp_a),
+                      "model_file": os.path.basename(mp_a), "ms_per_image": round(ms_a, 1)})
+        b_res = dict(mb)
+        b_res.update({"model": cfg.get("model_b_name") or os.path.basename(mp_b),
+                      "model_file": os.path.basename(mp_b), "ms_per_image": round(ms_b, 1)})
+        gt_total = both + only_a + only_b + neither
+        result = {"classes": classes, "a": a_res, "b": b_res,
+                  "agreement": {"both": both, "only_a": only_a, "only_b": only_b,
+                                "neither": neither, "gt": gt_total,
+                                # what a perfect A-or-B ensemble would have caught
+                                "union": both + only_a + only_b},
+                  "images": ma["images"], "tasks": len(task_ids),
+                  "conf": conf, "iou": iou_thr, "contain": bool(contain),
+                  "project_id": project_id, "name": cfg.get("name") or ""}
+        import time
+        finished_at = time.strftime("%Y-%m-%d %H:%M")
+        run_id = str(int(time.time() * 1000))
+        try:
+            with open(_cmp_details_path(run_id), "w", encoding="utf-8") as fh:
+                json.dump({"images": details}, fh)
+        except OSError:
+            pass
+        hist = _load_cmp_history()
+        hist.insert(0, {"id": run_id, "finished_at": finished_at,
+                        "config": config, "result": result})
+        _save_cmp_history(hist)
+        da = b_res["overall"]["map50"] - a_res["overall"]["map50"]
+        _set_cmp(running=False, state="done", result=result, config=config,
+                 finished_at=finished_at, run_id=run_id,
+                 message=f"done ✓ — {ma['images']} images, mAP A {a_res['overall']['map50']:.3f} "
+                         f"vs B {b_res['overall']['map50']:.3f} ({da:+.3f})")
+    except Exception as e:
+        _set_cmp(running=False, state="error", error=str(e), message=f"comparison failed: {e}")
+
+
+@app.route("/api/cmp/run", methods=["POST"])
+def api_cmp_run():
+    data = request.get_json(force=True) or {}
+    mp_a = _safe_model_path(data.get("model_a", ""))
+    mp_b = _safe_model_path(data.get("model_b", ""))
+    if not mp_a or not mp_b:
+        return jsonify({"error": "drop both models"}), 400
+    project_id = data.get("project_id")
+    task_ids = data.get("task_ids") or []
+    classes = data.get("classes") or []
+    if not project_id or not task_ids or not classes:
+        return jsonify({"error": "pick a ground-truth project and at least one task"}), 400
+    map_a = _parse_mapping(data.get("mapping_a"))
+    map_b = _parse_mapping(data.get("mapping_b"))
+    if not map_a or not map_b:
+        return jsonify({"error": "map at least one class for each model"}), 400
+    try:
+        conf = float(data.get("conf", 0.4) or 0.4)
+    except (TypeError, ValueError):
+        conf = 0.4
+    try:
+        iou_thr = float(data.get("iou", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        iou_thr = 0.5
+    contain = bool(data.get("contain", True))
+    config = {"model_a": data.get("model_a"), "model_b": data.get("model_b"),
+              "model_a_name": (data.get("model_a_name") or "").strip() or os.path.basename(mp_a),
+              "model_b_name": (data.get("model_b_name") or "").strip() or os.path.basename(mp_b),
+              "name": (data.get("name") or "").strip()[:80],
+              "project_id": project_id, "task_ids": task_ids, "classes": list(classes),
+              "conf": conf, "iou": iou_thr, "contain": contain,
+              "mapping_a": {str(k): v for k, v in map_a.items()},
+              "mapping_b": {str(k): v for k, v in map_b.items()}}
+    with _cmp_lock:
+        if _cmp_job["running"]:
+            return jsonify({"error": "a comparison is already running"}), 409
+        _cmp_job.update(running=True, state="starting", message="starting…", done=0,
+                        total=0, n_tasks=len(task_ids), result=None, error=None,
+                        config=config, finished_at=None)
+    threading.Thread(target=_do_compare,
+                     args=(mp_a, mp_b, project_id, task_ids, list(classes), conf, iou_thr,
+                           map_a, map_b, contain, config), daemon=True).start()
+    return jsonify({"started": True})
+
+
+@app.route("/api/cmp/status")
+def api_cmp_status():
+    with _cmp_lock:
+        return jsonify(dict(_cmp_job))
+
+
+@app.route("/api/cmp/history")
+def api_cmp_history():
+    out = []
+    for h in _load_cmp_history():
+        r = h.get("result") or {}
+        a = (r.get("a") or {}).get("overall") or {}
+        b = (r.get("b") or {}).get("overall") or {}
+        out.append({"id": h.get("id"), "finished_at": h.get("finished_at"),
+                    "name": r.get("name") or "",
+                    "model_a": (r.get("a") or {}).get("model"),
+                    "model_b": (r.get("b") or {}).get("model"),
+                    "project_id": r.get("project_id"), "tasks": r.get("tasks"),
+                    "images": r.get("images"), "conf": r.get("conf"), "iou": r.get("iou"),
+                    "map_a": a.get("map50"), "map_b": b.get("map50")})
+    return jsonify({"runs": out})
+
+
+@app.route("/api/cmp/history/<run_id>")
+def api_cmp_history_one(run_id):
+    for h in _load_cmp_history():
+        if str(h.get("id")) == str(run_id):
+            return jsonify(h)
+    return jsonify({"error": "run not found"}), 404
+
+
+@app.route("/api/cmp/history/<run_id>", methods=["DELETE"])
+def api_cmp_history_delete(run_id):
+    hist = [h for h in _load_cmp_history() if str(h.get("id")) != str(run_id)]
+    _save_cmp_history(hist)
+    try:
+        os.remove(_cmp_details_path(run_id))
+    except OSError:
+        pass
+    return jsonify({"ok": True, "runs": len(hist)})
+
+
+@app.route("/api/cmp/details/<run_id>")
+def api_cmp_details(run_id):
+    """Per-image GT + both models' boxes for one class."""
+    try:
+        with open(_cmp_details_path(run_id), encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return jsonify({"error": "no per-image detail for this run"}), 404
+    raw = request.args.get("cls")
+    if raw is None:
+        return jsonify(d)
+    try:
+        ci = int(raw)
+    except ValueError:
+        return jsonify({"error": "bad class"}), 400
+    out = []
+    for r in d.get("images", []):
+        gt = [b for b in r.get("gt", []) if b[0] == ci]
+        pa = [b for b in r.get("a", []) if b[0] == ci]
+        pb = [b for b in r.get("b", []) if b[0] == ci]
+        if not gt and not pa and not pb:
+            continue
+        a_tp = sum(1 for b in pa if b[6])
+        b_tp = sum(1 for b in pb if b[6])
+        out.append({"p": r["p"], "n": r.get("n", ""), "gt": gt, "a": pa, "b": pb,
+                    "a_tp": a_tp, "a_fp": len(pa) - a_tp,
+                    "a_fn": sum(1 for b in gt if not b[5]),
+                    "b_tp": b_tp, "b_fp": len(pb) - b_tp,
+                    "b_fn": sum(1 for b in gt if not b[6])})
+    # most interesting first: where the two models disagree the most
+    out.sort(key=lambda r: -(abs(r["a_tp"] - r["b_tp"]) + abs(r["a_fp"] - r["b_fp"])))
+    return jsonify({"cls": ci, "images": out})
 
 
 @app.route("/api/val/upload_model", methods=["POST"])
@@ -2505,6 +2783,40 @@ HTML = r"""<!DOCTYPE html>
   .val-ro{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-muted);
     background:var(--surface-2);border:1px solid var(--border);border-radius:999px;padding:4px 10px;margin-left:10px;}
   .val-page{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start;padding:26px 20px;}
+  /* ---- model comparison ---- */
+  #cmpview{z-index:197;}
+  .home-card.cmp .hc-icon{background:rgba(244,114,182,.15);color:#db2777;}
+  .cmp-two{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+  .dropzone.sm{padding:14px 10px;gap:3px;}
+  .ab{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
+    border-radius:5px;font-size:10px;font-weight:800;margin-right:6px;flex:none;color:#fff;}
+  .ab.a{background:#6366f1;} .ab.b{background:#db2777;}
+  .vc-panels.three{grid-template-columns:1fr 1fr 1fr;}
+  @media(max-width:1200px){.vc-panels.three{grid-template-columns:1fr;}}
+  .cmp-verdict{display:flex;align-items:center;gap:12px;padding:13px 16px;border-radius:var(--r-lg);
+    margin-bottom:16px;border:1px solid;background:var(--surface);box-shadow:var(--sh-sm);}
+  .cmp-verdict.a{border-color:#6366f1;background:rgba(99,102,241,.08);}
+  .cmp-verdict.b{border-color:#db2777;background:rgba(219,39,119,.08);}
+  .cmp-verdict.tie{border-color:var(--border-2);}
+  .cmp-verdict .cv-t{font-size:14.5px;font-weight:700;color:var(--text);}
+  .cmp-verdict .cv-s{font-size:12.5px;color:var(--text-muted);margin-top:2px;}
+  .cmp-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px;}
+  .cmp-tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);
+    padding:12px 14px;box-shadow:var(--sh-sm);}
+  .cmp-tile .ct-k{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
+    color:var(--text-muted);margin-bottom:8px;}
+  .cmp-tile .ct-row{display:flex;align-items:center;gap:6px;font-size:15px;font-weight:700;
+    font-variant-numeric:tabular-nums;color:var(--text);margin-bottom:3px;}
+  .cmp-tile .ct-row.win{color:var(--ok);}
+  .cmp-tile .ct-d{font-size:11.5px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums;}
+  .cmp-tile .ct-d.up{color:var(--ok);} .cmp-tile .ct-d.down{color:var(--danger);}
+  .cmp-tile .ct-d.flat{color:var(--text-dim);}
+  .agree{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:8px;}
+  .agree div{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;}
+  .agree .ag-k{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;
+    color:var(--text-muted);margin-bottom:4px;}
+  .agree .ag-v{font-size:18px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;}
+  table.valtab td.wa{color:#6366f1;font-weight:700;} table.valtab td.wb{color:#db2777;font-weight:700;}
   .dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;
     padding:22px 14px;border:2px dashed var(--border-2);border-radius:var(--r-lg);background:var(--bg);
     color:var(--text-muted);cursor:pointer;text-align:center;
@@ -2856,6 +3168,11 @@ HTML = r"""<!DOCTYPE html>
         <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="11" width="3" height="6" rx="1"/><rect x="12.5" y="7" width="3" height="10" rx="1"/><rect x="18" y="13" width="3" height="4" rx="1"/></svg></div>
         <div class="hc-title">Class count</div>
         <div class="hc-desc">Count annotations per class in a CVAT project — project-wide and broken down by task.</div>
+      </div>
+      <div class="home-card cmp" onclick="enterCmp()">
+        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M6 8H3l3-5 3 5H6zm0 0v6a2 2 0 0 0 2 2h1"/><path d="M18 8h-3l3-5 3 5h-3zm0 0v6a2 2 0 0 1-2 2h-1"/></svg></div>
+        <div class="hc-title">Model comparison</div>
+        <div class="hc-desc">Drop <b>two</b> models and score them head&#8209;to&#8209;head on the same ground truth &mdash; deltas, who finds what, and images side by side.</div>
       </div>
       <div class="home-card val" onclick="enterVal()">
         <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6.5v5c0 4.6 3.4 8.6 8 9.5 4.6-.9 8-4.9 8-9.5v-5z"/><path d="m9 12 2 2 4-4"/></svg></div>
@@ -3248,6 +3565,106 @@ HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div id="vcStrip" class="vc-strip"></div>
+  </div>
+</div>
+
+<div id="cmpview" class="browse">
+  <div class="browse-bar">
+    <button onclick="goHome()" title="home"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/></svg></button>
+    <span class="browse-title">Model comparison</span>
+    <span class="val-ro"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>read-only &mdash; the CVAT project is never modified</span>
+    <span class="spacer"></span>
+    <button id="cmphistbtn" onclick="cmpShowHistory()"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>History <span id="cmphistn" class="aptaskcount"></span></button>
+    <button id="cmpagain" onclick="cmpShowCfg()" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>New run</button>
+  </div>
+  <div class="val-page">
+    <div id="cmpcfg" class="modal" style="width:560px;">
+      <div class="modal-body">
+        <label>Run name <span class="valopt">optional</span></label>
+        <input id="cmpname" type="text" placeholder="e.g. v3 vs v4 · egypt tasks" maxlength="80">
+        <div class="cmp-two">
+          <div>
+            <label><span class="ab a">A</span> Model A</label>
+            <div id="cmpdropA" class="dropzone sm" onclick="document.getElementById('cmpfileA').click()">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5-5 5 5"/><path d="M12 5v12"/></svg>
+              <div class="dz-main">Drop <b>.pt</b></div>
+            </div>
+            <input type="file" id="cmpfileA" accept=".pt" style="display:none" onchange="cmpPickFile('a',this.files[0])">
+            <div id="cmpmodelA" class="val-model" style="display:none;"></div>
+          </div>
+          <div>
+            <label><span class="ab b">B</span> Model B</label>
+            <div id="cmpdropB" class="dropzone sm" onclick="document.getElementById('cmpfileB').click()">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5-5 5 5"/><path d="M12 5v12"/></svg>
+              <div class="dz-main">Drop <b>.pt</b></div>
+            </div>
+            <input type="file" id="cmpfileB" accept=".pt" style="display:none" onchange="cmpPickFile('b',this.files[0])">
+            <div id="cmpmodelB" class="val-model" style="display:none;"></div>
+          </div>
+        </div>
+        <label>Ground-truth project</label>
+        <div class="selrow">
+          <select id="cmpproj" onchange="cmpLoadTasks()"><option value="">— select project —</option></select>
+          <button onclick="cmpLoadProjects(true)" title="refresh projects"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
+        </div>
+        <label>Tasks <span id="cmptaskcount" class="aptaskcount"></span></label>
+        <div id="cmptasklist" class="aptasks"><div class="apt-empty">— select a project first —</div></div>
+        <div class="aprow">
+          <button onclick="cmpSelectAll(true)">All</button>
+          <button onclick="cmpSelectAll(false)">None</button>
+        </div>
+        <div class="val-two">
+          <div><label>Confidence</label><input id="cmpconf" type="number" min="0" max="1" step="0.05" value="0.4"></div>
+          <div><label>IoU match</label><input id="cmpiou" type="number" min="0.05" max="0.95" step="0.05" value="0.5"></div>
+        </div>
+        <label class="tick valtick"><input type="checkbox" id="cmpcontain" checked>
+          <span>Count a box fully inside the other as a match
+            <span class="valhint">&mdash; applied identically to both models.</span></span>
+        </label>
+        <div id="cmpmsg" class="aamsg"></div>
+      </div>
+      <div class="modal-f"><button id="cmpnext" class="ok" onclick="cmpNext()">Next</button></div>
+    </div>
+
+    <div id="cmpmapcard" class="modal" style="width:560px;display:none;">
+      <div class="modal-body">
+        <div class="maphint">Map each model&rsquo;s classes &rarr; the ground-truth classes (auto-matched by name):</div>
+        <div id="cmpmaplist"></div>
+        <div id="cmpmsg2" class="aamsg"></div>
+      </div>
+      <div class="modal-f">
+        <button onclick="cmpShowCfg()">Back</button>
+        <button id="cmprun" class="ok" onclick="runCompare()">Compare</button>
+      </div>
+    </div>
+
+    <div id="cmpprogcard" class="modal" style="width:560px;display:none;">
+      <div class="modal-body">
+        <div class="bar indet"><div id="cmpbar"></div></div>
+        <div id="cmpprogtext" style="font-size:13px;color:var(--text);margin-top:8px;"></div>
+      </div>
+    </div>
+  </div>
+  <div id="cmpresult" class="val-result" style="display:none;"></div>
+  <div id="cmphistview" class="val-result" style="display:none;"></div>
+
+  <div id="cmpclsview" class="vc-view" style="display:none;">
+    <div class="vc-bar">
+      <button class="vc-back" onclick="cmpShowResult()"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Report</button>
+      <span class="vc-title" id="ccTitle"></span>
+      <span class="vc-counts" id="ccCounts"></span>
+      <span class="spacer"></span>
+      <span class="vc-filters" id="ccFilters"></span>
+      <button onclick="ccGo(-1)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
+      <span id="ccPos" class="vc-pos">0 / 0</span>
+      <button onclick="ccGo(1)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>
+    </div>
+    <div class="vc-panels three">
+      <div class="vc-panel"><div class="vc-h"><span class="lg gt"></span>Ground truth <span class="vc-n" id="ccGtN"></span></div><div class="vc-cvwrap"><canvas id="ccGtCv"></canvas></div></div>
+      <div class="vc-panel"><div class="vc-h"><span class="ab a">A</span><span id="ccAName">Model A</span> <span class="vc-n" id="ccAN"></span></div><div class="vc-cvwrap"><canvas id="ccACv"></canvas></div></div>
+      <div class="vc-panel"><div class="vc-h"><span class="ab b">B</span><span id="ccBName">Model B</span> <span class="vc-n" id="ccBN"></span></div><div class="vc-cvwrap"><canvas id="ccBCv"></canvas></div></div>
+    </div>
+    <div id="ccStrip" class="vc-strip"></div>
   </div>
 </div>
 
@@ -3692,7 +4109,7 @@ function updateModeBadge(){
 }
 // only one full-screen surface at a time
 function hideAllScreens(){
-  ['home','cvatbrowse','ccview','apmodal','valview'].forEach(id=>{
+  ['home','cvatbrowse','ccview','apmodal','valview','cmpview'].forEach(id=>{
     const e=document.getElementById(id); if(e) e.style.display='none'; });
 }
 function enterLocal(){
@@ -5333,6 +5750,407 @@ function renderValResult(res, finishedAt){
   valShowResult();
 }
 
+// ================= Model comparison (two models, one ground truth) =================
+let cmpPoll=null, cmpA=null, cmpB=null, cmpGt=[], cmpMcA=[], cmpMcB=[],
+    cmpLastCfg=null, cmpRunId=null, cmpResult=null;
+function cmpMsg(t,el){ const e=document.getElementById(el||'cmpmsg'); if(e) e.textContent=t||''; }
+function _cmpCard(w){
+  document.getElementById('cmpcfg').style.display     = w==='cfg' ?'':'none';
+  document.getElementById('cmpmapcard').style.display = w==='map' ?'':'none';
+  document.getElementById('cmpprogcard').style.display= w==='prog'?'':'none';
+  document.querySelector('#cmpview .val-page').style.display = ['cfg','map','prog'].includes(w)?'flex':'none';
+  document.getElementById('cmpresult').style.display  = w==='result'?'block':'none';
+  document.getElementById('cmphistview').style.display= w==='hist'  ?'block':'none';
+  document.getElementById('cmpclsview').style.display = w==='cls'   ?'flex':'none';
+  document.getElementById('cmpagain').style.display   = ['result','hist'].includes(w)?'':'none';
+}
+function cmpShowCfg(){ _cmpCard('cfg'); cmpMsg(''); }
+function cmpShowMap(){ _cmpCard('map'); }
+function cmpShowProg(){ _cmpCard('prog'); }
+function cmpShowResult(){ _cmpCard('result'); }
+async function enterCmp(){
+  appMode='cvat'; applyMode(); hideAllScreens();
+  document.getElementById('cmpview').style.display='flex';
+  cmpShowCfg(); cmpHistCount();
+  await cmpLoadProjects();
+  let s=null; try{ s=await fetch('/api/cmp/status?t='+Date.now()).then(r=>r.json()); }catch(e){}
+  if(!s) return;
+  if(s.config){ cmpLastCfg=s.config; await cmpPrefill(s.config); }
+  if(s.running){ cmpShowProg(); pollCompare(); }
+}
+async function cmpPrefill(cfg){
+  try{
+    cmpClearModel('a'); cmpClearModel('b');           // always drop fresh models
+    document.getElementById('cmpname').value='';
+    document.getElementById('cmpconf').value=0.4;
+    if(cfg.iou!=null) document.getElementById('cmpiou').value=cfg.iou;
+    if(cfg.contain!=null) document.getElementById('cmpcontain').checked=!!cfg.contain;
+    const sel=document.getElementById('cmpproj');
+    sel.value=String(cfg.project_id); syncDD(sel);
+    if(!sel.value) return;
+    await cmpLoadTasks();
+    const ids=new Set((cfg.task_ids||[]).map(String));
+    document.querySelectorAll('#cmptasklist input[type=checkbox]').forEach(c=>{ c.checked=ids.has(c.value); });
+    cmpTaskCount();
+  }catch(e){}
+}
+// ---- model drops
+['A','B'].forEach(K=>{
+  const dz=document.getElementById('cmpdrop'+K); if(!dz) return;
+  ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();dz.classList.add('over');}));
+  ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();dz.classList.remove('over');}));
+  dz.addEventListener('drop',e=>{ const f=e.dataTransfer.files&&e.dataTransfer.files[0]; if(f) cmpPickFile(K.toLowerCase(),f); });
+});
+function cmpClearModel(k){
+  if(k==='a') cmpA=null; else cmpB=null;
+  document.getElementById('cmpmodel'+k.toUpperCase()).style.display='none';
+  document.getElementById('cmpfile'+k.toUpperCase()).value='';
+}
+function cmpChip(k,name,note){
+  const box=document.getElementById('cmpmodel'+k.toUpperCase());
+  box.innerHTML='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ok);flex:none;"><polyline points="20 6 9 17 4 12"/></svg>'
+    +'<span class="vm-name">'+escapeHtml(name)+'</span><span class="vm-size">'+escapeHtml(note||'')+'</span>';
+  box.style.display='flex';
+}
+async function cmpPickFile(k,f){
+  if(!f) return;
+  if(!f.name.toLowerCase().endsWith('.pt')){ cmpMsg('that is not a .pt file'); return; }
+  cmpMsg('uploading '+f.name+'…');
+  const fd=new FormData(); fd.append('model', f);
+  try{
+    const r=await fetch('/api/val/upload_model',{method:'POST',body:fd}).then(r=>r.json());
+    if(r.error){ cmpMsg('upload failed: '+r.error); return; }
+    const m={path:r.path, name:r.name};
+    if(k==='a') cmpA=m; else cmpB=m;
+    cmpChip(k, r.name, (r.size/1048576).toFixed(1)+' MB');
+    cmpMsg('');
+  }catch(e){ cmpMsg('upload failed'); }
+}
+async function cmpLoadProjects(refresh){
+  const sel=document.getElementById('cmpproj'); const prev=sel.value;
+  sel.innerHTML='<option value="">loading…</option>';
+  try{
+    const r=await fetch('/api/cvat/projects?'+(refresh?'refresh=1&':'')+'t='+Date.now()).then(r=>r.json());
+    sel.innerHTML='<option value="">— select project —</option>'
+      +(r.projects||[]).map(p=>'<option value="'+p.id+'">'+p.id+' — '+escapeHtml(p.name)+'</option>').join('');
+    if(prev) sel.value=prev;
+    syncDD(sel);
+  }catch(e){ sel.innerHTML='<option value="">— error —</option>'; }
+}
+async function cmpLoadTasks(){
+  const pid=document.getElementById('cmpproj').value;
+  const host=document.getElementById('cmptasklist');
+  cmpGt=[];
+  if(!pid){ host.innerHTML='<div class="apt-empty">— select a project first —</div>'; cmpTaskCount(); return; }
+  host.innerHTML='<div class="apt-empty">loading tasks…</div>';
+  try{
+    const [t,l]=await Promise.all([
+      fetch('/api/cvat/tasks?project_id='+encodeURIComponent(pid)+'&t='+Date.now()).then(r=>r.json()),
+      fetch('/api/cvat/projectlabels?project_id='+encodeURIComponent(pid)+'&t='+Date.now()).then(r=>r.json())]);
+    cmpGt=l.classes||[];
+    if(!t.tasks||!t.tasks.length){ host.innerHTML='<div class="apt-empty">no tasks</div>'; return; }
+    host.innerHTML=t.tasks.map(x=>'<label class="trow"><input type="checkbox" checked value="'+x.id
+      +'" onchange="cmpTaskCount()"><span class="tid">#'+x.id+'</span><span class="tname">'
+      +escapeHtml(x.name)+(x.size!=null?(' · '+x.size+' imgs'):'')+'</span></label>').join('');
+    cmpTaskCount(); cmpMsg(cmpGt.length+' ground-truth classes');
+  }catch(e){ host.innerHTML='<div class="apt-empty">failed to load tasks</div>'; }
+}
+function cmpTaskCount(){
+  const n=document.querySelectorAll('#cmptasklist input:checked').length;
+  const e=document.getElementById('cmptaskcount'); if(e) e.textContent=n?('· '+n+' selected'):'';
+}
+function cmpSelectAll(on){
+  document.querySelectorAll('#cmptasklist input[type=checkbox]').forEach(c=>c.checked=on); cmpTaskCount();
+}
+function cmpCheckedTasks(){
+  return [...document.querySelectorAll('#cmptasklist input:checked')].map(c=>parseInt(c.value,10));
+}
+async function cmpNext(){
+  if(!cmpA||!cmpB){ cmpMsg('drop BOTH models first'); return; }
+  if(!document.getElementById('cmpproj').value){ cmpMsg('select a ground-truth project'); return; }
+  if(!cmpCheckedTasks().length){ cmpMsg('select at least one task'); return; }
+  if(!cmpGt.length){ cmpMsg('this project has no labels'); return; }
+  cmpMsg('reading model classes…');
+  try{
+    const [a,b]=await Promise.all([
+      fetch('/api/modelclasses?model='+encodeURIComponent(cmpA.path)+'&t='+Date.now()).then(r=>r.json()),
+      fetch('/api/modelclasses?model='+encodeURIComponent(cmpB.path)+'&t='+Date.now()).then(r=>r.json())]);
+    if(a.error||b.error){ cmpMsg('error: '+(a.error||b.error)); return; }
+    cmpMcA=a.classes||[]; cmpMcB=b.classes||[];
+    buildCmpMap(); cmpMsg(''); cmpShowMap();
+  }catch(e){ cmpMsg('failed to read model classes'); }
+}
+function buildCmpMap(){
+  const lower={}; cmpGt.forEach((n,i)=>{ lower[String(n).trim().toLowerCase()]=i; });
+  const opts=(sel)=>'<option value="">— skip —</option>'
+    + cmpGt.map((n,i)=>'<option value="'+i+'"'+(i===sel?' selected':'')+'>'+i+': '+escapeHtml(n)+'</option>').join('');
+  const grp=(key,label,mc)=>'<div class="aa-mgroup" data-k="'+key+'"><div class="aa-mname">'
+    +'<span class="ab '+key+'">'+key.toUpperCase()+'</span>'+escapeHtml(label)+'</div>'
+    + mc.map((mn,mi)=>{
+        const m=lower[String(mn).trim().toLowerCase()];
+        return '<div class="maprow"><span class="mc" title="'+escapeHtml(mn)+'">'+mi+': '+escapeHtml(mn)
+          +'</span><span class="arr">→</span><select data-mi="'+mi+'">'+opts(m===undefined?-1:m)+'</select></div>';
+      }).join('') + '</div>';
+  const host=document.getElementById('cmpmaplist');
+  host.innerHTML = grp('a', cmpA.name, cmpMcA) + grp('b', cmpB.name, cmpMcB);
+  host.querySelectorAll('select').forEach(enhanceSelect);
+}
+async function runCompare(){
+  const pick=(k)=>{ const g=document.querySelector('#cmpmaplist .aa-mgroup[data-k="'+k+'"]'); const m={};
+    if(g) g.querySelectorAll('select').forEach(s=>{ if(s.value!=='') m[s.getAttribute('data-mi')]=parseInt(s.value,10); });
+    return m; };
+  const ma=pick('a'), mb=pick('b');
+  if(!Object.keys(ma).length || !Object.keys(mb).length){ cmpMsg('map at least one class for EACH model','cmpmsg2'); return; }
+  const body={ name:document.getElementById('cmpname').value.trim(),
+    model_a:cmpA.path, model_a_name:cmpA.name, model_b:cmpB.path, model_b_name:cmpB.name,
+    project_id:document.getElementById('cmpproj').value, task_ids:cmpCheckedTasks(),
+    classes:cmpGt, mapping_a:ma, mapping_b:mb,
+    conf:parseFloat(document.getElementById('cmpconf').value)||0.4,
+    iou:parseFloat(document.getElementById('cmpiou').value)||0.5,
+    contain:document.getElementById('cmpcontain').checked };
+  cmpMsg('','cmpmsg2'); cmpShowProg();
+  document.getElementById('cmpprogtext').textContent='starting…';
+  try{
+    const r=await fetch('/api/cmp/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}).then(r=>r.json());
+    if(r.error){ document.getElementById('cmpprogtext').textContent='error: '+r.error; return; }
+    pollCompare();
+  }catch(e){ document.getElementById('cmpprogtext').textContent='request failed'; }
+}
+function pollCompare(){
+  clearInterval(cmpPoll);
+  cmpPoll=setInterval(async()=>{
+    let s; try{ s=await fetch('/api/cmp/status?t='+Date.now()).then(r=>r.json()); }catch(e){ return; }
+    let t=s.message||s.state||'';
+    if(s.running && s.total) t+=' ('+s.done+'/'+s.total+')';
+    document.getElementById('cmpprogtext').textContent=t;
+    if(!s.running){
+      clearInterval(cmpPoll);
+      if(s.error) return;
+      if(s.run_id) cmpRunId=s.run_id;
+      if(s.result){ renderCmpResult(s.result, s.finished_at); cmpHistCount(); }
+    }
+  }, 1000);
+}
+
+// ---- comparison report
+function dlt(v,dp){ const t=(v>0?'+':'')+v.toFixed(dp===undefined?3:dp);
+  return '<span class="ct-d '+(Math.abs(v)<1e-9?'flat':(v>0?'up':'down'))+'">'+t+'</span>'; }
+function cmpTile(k, av, bv, fmt, higherIsBetter){
+  const f = fmt || (x=>x.toFixed(3));
+  const d = bv-av, better = higherIsBetter===false ? (d<0) : (d>0);
+  return '<div class="cmp-tile"><div class="ct-k">'+k+'</div>'
+    +'<div class="ct-row'+((!better && Math.abs(d)>1e-9)?' win':'')+'"><span class="ab a">A</span>'+f(av)+'</div>'
+    +'<div class="ct-row'+((better && Math.abs(d)>1e-9)?' win':'')+'"><span class="ab b">B</span>'+f(bv)+'</div>'
+    +'<div>'+((higherIsBetter===false)
+        ? '<span class="ct-d '+(Math.abs(d)<1e-9?'flat':(d<0?'up':'down'))+'">'+(d>0?'+':'')+d.toFixed(1)+'</span>'
+        : dlt(d))+'</div></div>';
+}
+function renderCmpResult(res, finishedAt){
+  cmpResult=res;
+  const a=res.a, b=res.b, oa=a.overall, ob=b.overall, ag=res.agreement||{};
+  const dmap=ob.map50-oa.map50;
+  const win = Math.abs(dmap)<0.01 ? 'tie' : (dmap>0?'b':'a');
+  let h='';
+  if(res.name) h+='<div class="val-name">'+escapeHtml(res.name)+'</div>';
+  h+='<div class="val-sub"><span class="ab a">A</span>'+escapeHtml(a.model||'')
+    +' &nbsp;vs&nbsp; <span class="ab b">B</span>'+escapeHtml(b.model||'')
+    +' &nbsp;·&nbsp; project '+escapeHtml(String(res.project_id||''))+' &nbsp;·&nbsp; '
+    +(res.tasks||0)+' task(s), '+(res.images||0)+' images &nbsp;·&nbsp; conf &ge; '+res.conf
+    +' &nbsp;·&nbsp; IoU &ge; '+res.iou+(res.contain?' or contained':'')
+    +(finishedAt?(' &nbsp;·&nbsp; <b>'+escapeHtml(finishedAt)+'</b>'):'')
+    +' &nbsp;·&nbsp; both scored on identical ground truth, which was only read</div>';
+  // verdict
+  const wn = win==='a'?a.model : win==='b'?b.model : '';
+  h+='<div class="cmp-verdict '+win+'"><div>'
+    +(win==='tie'
+      ? '<div class="cv-t">Too close to call — mAP@50 '+oa.map50.toFixed(3)+' vs '+ob.map50.toFixed(3)+'</div>'
+        +'<div class="cv-s">Neither model is meaningfully ahead. Decide on speed or on the classes you care about.</div>'
+      : '<div class="cv-t"><span class="ab '+win+'">'+win.toUpperCase()+'</span>'+escapeHtml(wn)+' wins — mAP@50 '
+        +Math.max(oa.map50,ob.map50).toFixed(3)+' vs '+Math.min(oa.map50,ob.map50).toFixed(3)
+        +' ('+(dmap>0?'+':'')+dmap.toFixed(3)+')</div>'
+        +'<div class="cv-s">'+escapeHtml(wn)+' is ahead on precision, recall and F1 as well.</div>')
+    +'</div></div>';
+  // tiles
+  h+='<div class="cmp-tiles">'
+    +cmpTile('mAP@50', oa.map50, ob.map50)
+    +cmpTile('Precision', oa.precision, ob.precision, pct)
+    +cmpTile('Recall', oa.recall, ob.recall, pct)
+    +cmpTile('F1', oa.f1, ob.f1, pct)
+    +cmpTile('Accuracy', accOf(oa), accOf(ob), pct)
+    +cmpTile('Speed (ms/img)', a.ms_per_image||0, b.ms_per_image||0, x=>x.toFixed(0)+' ms', false)
+    +'</div>';
+  // agreement — the bit a side-by-side report normally can't tell you
+  const gtn=ag.gt||0, p=(x)=>gtn?((x/gtn*100).toFixed(0)+'%'):'0%';
+  h+='<div class="ins-card" style="margin-bottom:16px;"><div class="ins-h" style="color:var(--accent);">'
+    +'Who found what &mdash; across all '+gtn+' ground-truth objects</div>'
+    +'<div class="agree">'
+    +'<div><div class="ag-k">Both found</div><div class="ag-v">'+(ag.both||0)+'</div><div class="ag-k">'+p(ag.both||0)+'</div></div>'
+    +'<div><div class="ag-k"><span class="ab a">A</span>only A</div><div class="ag-v">'+(ag.only_a||0)+'</div><div class="ag-k">'+p(ag.only_a||0)+'</div></div>'
+    +'<div><div class="ag-k"><span class="ab b">B</span>only B</div><div class="ag-v">'+(ag.only_b||0)+'</div><div class="ag-k">'+p(ag.only_b||0)+'</div></div>'
+    +'<div><div class="ag-k">Neither found</div><div class="ag-v">'+(ag.neither||0)+'</div><div class="ag-k">'+p(ag.neither||0)+'</div></div>'
+    +'<div><div class="ag-k">A or B (ensemble)</div><div class="ag-v">'+(ag.union||0)+'</div><div class="ag-k">'+p(ag.union||0)+'</div></div>'
+    +'</div><ul style="margin:10px 0 0;padding-left:17px;">'
+    +'<li style="font-size:12.5px;color:var(--text);line-height:1.55;">'
+      +((ag.only_b||0)>(ag.only_a||0)*2
+        ? '<b>B strictly dominates</b> — it finds '+(ag.only_b||0)+' objects A misses, while A only finds '+(ag.only_a||0)+' that B misses.'
+        : ((ag.only_a||0)>(ag.only_b||0)*2
+          ? '<b>A strictly dominates</b> — it finds '+(ag.only_a||0)+' objects B misses, while B only finds '+(ag.only_b||0)+' that A misses.'
+          : '<b>The models are complementary</b> — A uniquely finds '+(ag.only_a||0)+' and B uniquely finds '+(ag.only_b||0)+'. Running both would beat either alone.'))
+    +'</li>'
+    +'<li style="font-size:12.5px;color:var(--text-muted);line-height:1.55;">'
+      +(ag.neither||0)+' objects ('+p(ag.neither||0)+') are missed by <b>both</b> — no amount of picking between these two models will catch them.'
+    +'</li></ul></div>';
+  // per-class head to head
+  h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th>'
+    +'<th>A · AP</th><th>B · AP</th><th>Δ AP</th>'
+    +'<th>A · P</th><th>B · P</th><th>A · R</th><th>B · R</th><th>Winner</th></tr></thead><tbody>';
+  (a.per_class||[]).forEach((ca,ci)=>{
+    const cb=(b.per_class||[])[ci]||{}; const d=(cb.ap50||0)-(ca.ap50||0);
+    const w = !ca.gt ? '' : (Math.abs(d)<0.01 ? '<span class="cbadge">tie</span>'
+      : (d>0 ? '<span class="ab b">B</span>' : '<span class="ab a">A</span>'));
+    const dim = ca.gt ? '' : ' class="dim"';
+    h+='<tr><td><button class="clslink" onclick="cmpOpenClass('+ci+')">'+escapeHtml(ca.name)+'</button></td>'
+      +'<td'+dim+'>'+ca.gt+'</td>'
+      +'<td'+(d<0?' class="wa"':'')+'>'+(ca.ap50||0).toFixed(3)+'</td>'
+      +'<td'+(d>0?' class="wb"':'')+'>'+(cb.ap50||0).toFixed(3)+'</td>'
+      +'<td>'+(ca.gt?dlt(d):'—')+'</td>'
+      +'<td>'+pct(ca.precision||0)+'</td><td>'+pct(cb.precision||0)+'</td>'
+      +'<td>'+pct(ca.recall||0)+'</td><td>'+pct(cb.recall||0)+'</td>'
+      +'<td>'+w+'</td></tr>';
+  });
+  h+='<tr class="total"><td>ALL</td><td>'+(oa.gt||0)+'</td>'
+    +'<td>'+oa.map50.toFixed(3)+'</td><td>'+ob.map50.toFixed(3)+'</td><td>'+dlt(dmap)+'</td>'
+    +'<td>'+pct(oa.precision)+'</td><td>'+pct(ob.precision)+'</td>'
+    +'<td>'+pct(oa.recall)+'</td><td>'+pct(ob.recall)+'</td>'
+    +'<td>'+(win==='tie'?'—':'<span class="ab '+win+'">'+win.toUpperCase()+'</span>')+'</td></tr>';
+  h+='</tbody></table>';
+  document.getElementById('cmpresult').innerHTML=h;
+  cmpShowResult();
+}
+// ---- comparison history
+async function cmpHistCount(){
+  try{
+    const r=await fetch('/api/cmp/history?t='+Date.now()).then(r=>r.json());
+    const n=(r.runs||[]).length;
+    const e=document.getElementById('cmphistn'); if(e) e.textContent=n?('· '+n):'';
+    return r.runs||[];
+  }catch(e){ return []; }
+}
+async function cmpShowHistory(){
+  const host=document.getElementById('cmphistview');
+  host.innerHTML='<div class="browse-empty">loading…</div>'; _cmpCard('hist');
+  const runs=await cmpHistCount();
+  if(!runs.length){ host.innerHTML='<div class="browse-empty">No comparisons yet.</div>'; return; }
+  let h='<div class="val-sub">'+runs.length+' past comparison(s) — click one to open its report.</div>';
+  h+='<table class="valtab"><thead><tr><th>When</th><th>Run</th><th>Model A</th><th>Model B</th>'
+    +'<th>Project</th><th>Images</th><th>A · mAP</th><th>B · mAP</th><th>Δ</th><th></th></tr></thead><tbody>';
+  runs.forEach(r=>{
+    const d=(r.map_b||0)-(r.map_a||0);
+    h+='<tr class="histrow" onclick="cmpOpenRun(\''+r.id+'\')">'
+      +'<td>'+escapeHtml(r.finished_at||'')+'</td>'
+      +(r.name?'<td class="runname">'+escapeHtml(r.name)+'</td>':'<td class="dim">—</td>')
+      +'<td>'+escapeHtml(r.model_a||'')+'</td><td>'+escapeHtml(r.model_b||'')+'</td>'
+      +'<td>'+escapeHtml(String(r.project_id||''))+'</td><td>'+(r.images||0)+'</td>'
+      +'<td'+(d<0?' class="wa"':'')+'>'+(r.map_a||0).toFixed(3)+'</td>'
+      +'<td'+(d>0?' class="wb"':'')+'>'+(r.map_b||0).toFixed(3)+'</td>'
+      +'<td>'+dlt(d)+'</td>'
+      +'<td><button class="histdel" onclick="event.stopPropagation();cmpDeleteRun(\''+r.id+'\')">'
+      +'<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button></td></tr>';
+  });
+  h+='</tbody></table>';
+  host.innerHTML=h;
+}
+async function cmpOpenRun(id){
+  try{
+    const h=await fetch('/api/cmp/history/'+encodeURIComponent(id)+'?t='+Date.now()).then(r=>r.json());
+    if(h.error) return;
+    cmpRunId=h.id; if(h.config) cmpLastCfg=h.config;
+    renderCmpResult(h.result, h.finished_at);
+  }catch(e){}
+}
+async function cmpDeleteRun(id){
+  if(!(await appConfirm('Delete this comparison from the history?',{title:'Delete run',ok:'Delete',danger:true}))) return;
+  try{ await fetch('/api/cmp/history/'+encodeURIComponent(id),{method:'DELETE'}); }catch(e){}
+  cmpShowHistory();
+}
+// ---- 3-panel viewer: GT | A | B
+let ccAll=[], ccImgs=[], ccIdx=0, ccFilter='all';
+async function cmpOpenClass(ci){
+  if(!cmpRunId || !cmpResult) return;
+  const c=(cmpResult.a.per_class||[])[ci]; if(!c) return;
+  _cmpCard('cls');
+  document.getElementById('ccTitle').textContent=c.name;
+  document.getElementById('ccAName').textContent=cmpResult.a.model||'Model A';
+  document.getElementById('ccBName').textContent=cmpResult.b.model||'Model B';
+  document.getElementById('ccCounts').textContent='loading…';
+  ccAll=[]; ccImgs=[]; ccIdx=0; ccFilter='all';
+  try{
+    const r=await fetch('/api/cmp/details/'+encodeURIComponent(cmpRunId)+'?cls='+ci
+      +'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ document.getElementById('ccCounts').textContent=r.error; return; }
+    ccAll=r.images||[]; ccApplyFilter();
+  }catch(e){ document.getElementById('ccCounts').textContent='failed to load'; }
+}
+function ccApplyFilter(){
+  ccImgs=ccAll.filter(r=>{
+    if(ccFilter==='awin') return r.a_tp>r.b_tp;
+    if(ccFilter==='bwin') return r.b_tp>r.a_tp;
+    if(ccFilter==='bothmiss') return r.a_fn>0 && r.b_fn>0;
+    if(ccFilter==='disagree') return r.a_tp!==r.b_tp || r.a_fp!==r.b_fp;
+    return true;
+  });
+  const T=ccAll.reduce((x,r)=>({gt:x.gt+r.gt.length, atp:x.atp+r.a_tp, btp:x.btp+r.b_tp,
+    afp:x.afp+r.a_fp, bfp:x.bfp+r.b_fp}),{gt:0,atp:0,btp:0,afp:0,bfp:0});
+  document.getElementById('ccCounts').innerHTML='<span class="cbadge gt">GT '+T.gt+'</span>'
+    +'<span class="cbadge tp"><span class="ab a">A</span>TP '+T.atp+'</span>'
+    +'<span class="cbadge tp"><span class="ab b">B</span>TP '+T.btp+'</span>'
+    +'<span class="cbadge fp"><span class="ab a">A</span>FP '+T.afp+'</span>'
+    +'<span class="cbadge fp"><span class="ab b">B</span>FP '+T.bfp+'</span>';
+  const n=(f)=>ccAll.filter(r=>{
+    if(f==='awin') return r.a_tp>r.b_tp;
+    if(f==='bwin') return r.b_tp>r.a_tp;
+    if(f==='bothmiss') return r.a_fn>0 && r.b_fn>0;
+    if(f==='disagree') return r.a_tp!==r.b_tp || r.a_fp!==r.b_fp;
+    return true;}).length;
+  document.getElementById('ccFilters').innerHTML=[
+    ['all','All '+ccAll.length], ['disagree','Disagree '+n('disagree')],
+    ['awin','A better '+n('awin')], ['bwin','B better '+n('bwin')],
+    ['bothmiss','Both miss '+n('bothmiss')]
+  ].map(([k,l])=>'<button class="vcf'+(ccFilter===k?' on':'')+'" onclick="ccSetFilter(\''+k+'\')">'+l+'</button>').join('');
+  ccIdx=0; ccShow(0);
+}
+function ccSetFilter(f){ ccFilter=f; ccApplyFilter(); }
+function ccStrip(){
+  const s=document.getElementById('ccStrip');
+  if(!ccImgs.length){ s.innerHTML='<div class="vc-empty">no images match this filter</div>'; return; }
+  s.innerHTML=ccImgs.map((r,i)=>'<button class="vcchip'+(i===ccIdx?' on':'')+'" onclick="ccShow('+i+')" title="'
+    +escapeHtml(r.n||'')+'"><span class="vcchip-n">'+(i+1)+'</span>'
+    +'<span class="cbadge tp"><span class="ab a">A</span>'+r.a_tp+'</span>'
+    +'<span class="cbadge tp"><span class="ab b">B</span>'+r.b_tp+'</span></button>').join('');
+  const on=s.querySelector('.vcchip.on'); if(on&&on.scrollIntoView) on.scrollIntoView({block:'nearest',inline:'nearest'});
+}
+function ccGo(d){ if(ccImgs.length) ccShow(ccIdx+d); }
+function ccShow(i){
+  if(!ccImgs.length){ ccStrip(); return; }
+  ccIdx=Math.max(0,Math.min(ccImgs.length-1,i));
+  const r=ccImgs[ccIdx];
+  document.getElementById('ccPos').textContent=(ccIdx+1)+' / '+ccImgs.length;
+  document.getElementById('ccGtN').textContent=r.gt.length+' box'+(r.gt.length===1?'':'es');
+  document.getElementById('ccAN').innerHTML=vcBadges(r.a_tp,r.a_fp,r.a_fn);
+  document.getElementById('ccBN').innerHTML=vcBadges(r.b_tp,r.b_fp,r.b_fn);
+  ccStrip();
+  const im=new Image();
+  im.onload=()=>{
+    vcPaint('ccGtCv', im, r.gt.map(b=>({b,k:'gt'})));
+    vcPaint('ccACv', im, r.a.map(b=>({b,k:b[6]?'tp':'fp'}))
+      .concat(r.gt.filter(b=>!b[5]).map(b=>({b,k:'fn'}))));
+    vcPaint('ccBCv', im, r.b.map(b=>({b,k:b[6]?'tp':'fp'}))
+      .concat(r.gt.filter(b=>!b[6]).map(b=>({b,k:'fn'}))));
+  };
+  im.src='/api/val/image?p='+encodeURIComponent(r.p);
+}
+
 async function saveIfDirty(){
   if(touched){
     if(document.getElementById('autosave').checked) await save();
@@ -5556,7 +6374,7 @@ window.addEventListener('resize', ()=>{ if(img.complete){ fit(); draw(); } });
   updateThemeIcons();          // set the light/dark toggle icons
   showContinueCard(m);         // offer to resume the last session from the home page
   enhanceSelects(['classsel','cvatproj','aamode','apmodel',
-                  'approj','apmode','cvUploadProj','ccproj','clsproj','valproj']);  // styled dropdowns
+                  'approj','apmode','cvUploadProj','ccproj','clsproj','valproj','cmpproj']);  // styled dropdowns
   loadCvatProjects();          // populate the CVAT project dropdown in the background
   if(!count){ setStatus('no images in '+(m.path||'')+' — set a folder above'); return; }
   load(startIdx);

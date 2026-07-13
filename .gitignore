@@ -12,3 +12,4 @@ validation/
 node_modules/
 package-lock.json
 .val_history.json
+.cmp_history.json
