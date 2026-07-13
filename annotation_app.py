@@ -2907,6 +2907,10 @@ HTML = r"""<!DOCTYPE html>
   .vc-title{font-size:15px;font-weight:700;color:var(--text);}
   .vc-pos{font-size:12.5px;color:var(--text-muted);font-variant-numeric:tabular-nums;min-width:64px;text-align:center;}
   .vc-filters{display:inline-flex;gap:6px;margin-right:6px;}
+  .vc-keys{font-size:11px;color:var(--text-dim);margin-right:10px;white-space:nowrap;}
+  .vc-keys kbd{font-family:ui-monospace,Menlo,monospace;font-size:10px;background:var(--surface-2);
+    border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;padding:1px 5px;
+    margin:0 1px;color:var(--text-muted);}
   .vcf{font-size:11.5px !important;padding:5px 9px !important;color:var(--text-muted) !important;}
   .vcf.on{background:var(--accent-soft) !important;color:var(--accent) !important;border-color:var(--accent) !important;font-weight:600;}
   .cbadge{display:inline-flex;align-items:center;font-size:10px;font-weight:700;padding:2px 6px;
@@ -3557,6 +3561,7 @@ HTML = r"""<!DOCTYPE html>
       <span class="vc-title" id="vcTitle"></span>
       <span class="vc-counts" id="vcCounts"></span>
       <span class="spacer"></span>
+      <span class="vc-keys"><kbd>&larr;</kbd><kbd>&rarr;</kbd> navigate &middot; <kbd>1</kbd>&ndash;<kbd>5</kbd> filter &middot; <kbd>Esc</kbd> back</span>
       <span class="vc-filters" id="vcFilters"></span>
       <button onclick="vcGo(-1)" title="previous image"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
       <span id="vcPos" class="vc-pos">0 / 0</span>
@@ -3665,6 +3670,7 @@ HTML = r"""<!DOCTYPE html>
       <span class="vc-title" id="ccTitle"></span>
       <span class="vc-counts" id="ccCounts"></span>
       <span class="spacer"></span>
+      <span class="vc-keys"><kbd>&larr;</kbd><kbd>&rarr;</kbd> navigate &middot; <kbd>1</kbd>&ndash;<kbd>5</kbd> filter &middot; <kbd>Esc</kbd> back</span>
       <span class="vc-filters" id="ccFilters"></span>
       <button onclick="ccGo(-1)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
       <span id="ccPos" class="vc-pos">0 / 0</span>
@@ -6368,6 +6374,28 @@ window.addEventListener('keydown', e=>{
     return;
   }
   if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT' || e.target.tagName==='TEXTAREA') return;
+  // ---- class image viewer (validation / comparison): keyboard navigation ----
+  const _vo=document.getElementById('valclsview'), _co=document.getElementById('cmpclsview');
+  const vOpen=_vo && _vo.style.display==='flex', cOpen=_co && _co.style.display==='flex';
+  if(vOpen || cOpen){
+    const go   = vOpen ? vcGo   : ccGo;
+    const show = vOpen ? vcShow : ccShow;
+    const list = vOpen ? vcImgs : ccImgs;
+    const back = vOpen ? valShowResult : cmpShowResult;
+    const setF = vOpen ? vcSetFilter : ccSetFilter;
+    const filters = vOpen ? ['all','fn','fp','ok'] : ['all','disagree','awin','bwin','bothmiss'];
+    if(e.key==='ArrowRight'||e.key==='d'||e.key==='D'){ e.preventDefault(); go(1); return; }
+    if(e.key==='ArrowLeft' ||e.key==='a'||e.key==='A'){ e.preventDefault(); go(-1); return; }
+    if(e.key==='Home'){ e.preventDefault(); show(0); return; }
+    if(e.key==='End'){  e.preventDefault(); show(list.length-1); return; }
+    if(e.key==='Escape'){ e.preventDefault(); back(); return; }
+    if(/^[1-9]$/.test(e.key)){
+      const f=filters[parseInt(e.key,10)-1];
+      if(f){ e.preventDefault(); setF(f); }
+      return;
+    }
+    return;                       // swallow the editor shortcuts while the viewer is up
+  }
   if(e.ctrlKey||e.metaKey){                       // undo / redo
     const k=e.key.toLowerCase();
     if(k==='z'){ e.preventDefault(); e.shiftKey?redo():undo(); return; }
