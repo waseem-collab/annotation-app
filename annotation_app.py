@@ -1942,22 +1942,27 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
             prec = tp[ci] / (tp[ci] + fp[ci]) if (tp[ci] + fp[ci]) else 0.0
             rec = matched / gt_count[ci] if gt_count[ci] else 0.0
             f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+            # detection "accuracy": correct hits over everything that happened.
+            # (There are no true negatives to count in detection, so TP/(TP+FP+FN).)
+            denom = tp[ci] + fp[ci] + fn
+            accuracy = tp[ci] / denom if denom else 0.0
             ap = _average_precision(det_pool[ci], gt_count[ci])
             if gt_count[ci]:
                 sum_ap += ap
                 n_present += 1
             per_class.append({"name": classes[ci], "gt": gt_count[ci], "tp": tp[ci],
                               "fp": fp[ci], "fn": fn, "precision": prec, "recall": rec,
-                              "f1": f1, "ap50": ap})
+                              "f1": f1, "accuracy": accuracy, "ap50": ap})
         TP, FP = sum(tp), sum(fp)
         GT = sum(gt_count)
         FN = max(0, GT - TP)
         P = TP / (TP + FP) if (TP + FP) else 0.0
         R = TP / GT if GT else 0.0
         F1 = (2 * P * R / (P + R)) if (P + R) else 0.0
+        ACC = TP / (TP + FP + FN) if (TP + FP + FN) else 0.0
         result = {"classes": classes, "per_class": per_class,
                   "overall": {"gt": GT, "tp": TP, "fp": FP, "fn": FN,
-                              "precision": P, "recall": R, "f1": F1,
+                              "precision": P, "recall": R, "f1": F1, "accuracy": ACC,
                               "map50": (sum_ap / n_present) if n_present else 0.0},
                   "images": n_images, "tasks": len(task_ids),
                   "conf": conf, "iou": iou_thr,
@@ -2080,12 +2085,16 @@ def api_val_history():
         r = h.get("result") or {}
         o = r.get("overall") or {}
         c = h.get("config") or {}
+        tp, fp, fn = o.get("tp") or 0, o.get("fp") or 0, o.get("fn") or 0
+        acc = o.get("accuracy")
+        if acc is None:                       # older runs: derive it
+            acc = tp / (tp + fp + fn) if (tp + fp + fn) else 0.0
         out.append({"id": h.get("id"), "finished_at": h.get("finished_at"),
                     "model": r.get("model") or c.get("model_name"),
                     "project_id": r.get("project_id"), "tasks": r.get("tasks"),
                     "images": r.get("images"), "conf": r.get("conf"), "iou": r.get("iou"),
                     "map50": o.get("map50"), "precision": o.get("precision"),
-                    "recall": o.get("recall"), "f1": o.get("f1")})
+                    "recall": o.get("recall"), "f1": o.get("f1"), "accuracy": acc})
     return jsonify({"runs": out})
 
 
@@ -4635,7 +4644,8 @@ async function valShowHistory(){
   if(!runs.length){ host.innerHTML='<div class="browse-empty">No past runs yet — validate a model and it will show up here.</div>'; return; }
   let h='<div class="val-sub">'+runs.length+' past run(s) — newest first. Click one to view its full report.</div>';
   h+='<table class="valtab"><thead><tr><th>When</th><th>Model</th><th>Project</th><th>Tasks</th>'
-    +'<th>Images</th><th>conf / IoU</th><th>mAP@50</th><th>Precision</th><th>Recall</th><th>F1</th><th></th></tr></thead><tbody>';
+    +'<th>Images</th><th>conf / IoU</th><th>mAP@50</th><th>Precision</th><th>Recall</th><th>F1</th>'
+    +'<th title="TP / (TP + FP + FN)">Accuracy</th><th></th></tr></thead><tbody>';
   runs.forEach(r=>{
     h+='<tr class="histrow" onclick="valOpenRun(\''+r.id+'\')">'
       +'<td>'+escapeHtml(r.finished_at||'')+'</td>'
@@ -4645,6 +4655,7 @@ async function valShowHistory(){
       +'<td class="dim">'+r.conf+' / '+r.iou+'</td>'
       +'<td><b>'+(r.map50||0).toFixed(3)+'</b></td>'
       +'<td>'+pct(r.precision||0)+'</td><td>'+pct(r.recall||0)+'</td><td>'+pct(r.f1||0)+'</td>'
+      +'<td>'+pct(r.accuracy||0)+'</td>'
       +'<td><button class="histdel" title="delete this run" onclick="event.stopPropagation();valDeleteRun(\''+r.id+'\')">'
       +'<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button></td></tr>';
   });
@@ -4828,6 +4839,14 @@ function pollValidation(){
   }, 1000);
 }
 function pct(x){ return (x*100).toFixed(1)+'%'; }
+// Detection accuracy = TP / (TP + FP + FN). There are no true negatives to count in
+// detection, so this is "of everything that happened, how much was correct".
+// Falls back to computing it, so runs saved before this metric existed still show it.
+function accOf(x){
+  if(x && typeof x.accuracy==='number') return x.accuracy;
+  const tp=(x&&x.tp)||0, fp=(x&&x.fp)||0, fn=(x&&x.fn)||0, d=tp+fp+fn;
+  return d ? tp/d : 0;
+}
 // Turn the raw metrics into plain-language findings: what's solid, what needs work.
 function valInsights(res){
   const o=res.overall||{}, cls=res.per_class||[];
@@ -4898,6 +4917,7 @@ function renderValResult(res, finishedAt){
     +'<div class="val-tile"><div class="vt-k">Precision</div><div class="vt-v">'+pct(o.precision||0)+'</div></div>'
     +'<div class="val-tile"><div class="vt-k">Recall</div><div class="vt-v">'+pct(o.recall||0)+'</div></div>'
     +'<div class="val-tile"><div class="vt-k">F1</div><div class="vt-v">'+pct(o.f1||0)+'</div></div>'
+    +'<div class="val-tile"><div class="vt-k" title="TP / (TP + FP + FN)">Accuracy</div><div class="vt-v">'+pct(accOf(o))+'</div></div>'
     +'<div class="val-tile"><div class="vt-k">Images</div><div class="vt-v">'+(res.images||0)+'</div></div>'
     +'<div class="val-tile"><div class="vt-k">TP / FP / FN</div><div class="vt-v" style="font-size:16px;">'
       +(o.tp||0)+' / '+(o.fp||0)+' / '+(o.fn||0)+'</div></div>'
@@ -4926,14 +4946,17 @@ function renderValResult(res, finishedAt){
     h+='<div class="ins-notes"><ul>'+ins.notes.map(t=>'<li>'+t+'</li>').join('')+'</ul></div>';
 
   h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th><th>TP</th><th>FP</th><th>FN</th>'
-    +'<th>Precision</th><th>Recall</th><th>F1</th><th>AP@50</th></tr></thead><tbody>';
+    +'<th>Precision</th><th>Recall</th><th>F1</th><th title="TP / (TP + FP + FN)">Accuracy</th>'
+    +'<th>AP@50</th></tr></thead><tbody>';
   (res.per_class||[]).forEach(c=>{
     const dim = c.gt ? '' : ' class="dim"';
     h+='<tr><td>'+escapeHtml(c.name)+'</td><td'+dim+'>'+c.gt+'</td><td>'+c.tp+'</td><td>'+c.fp+'</td><td>'+c.fn+'</td>'
-      +'<td>'+pct(c.precision)+'</td><td>'+pct(c.recall)+'</td><td>'+pct(c.f1)+'</td><td>'+c.ap50.toFixed(3)+'</td></tr>';
+      +'<td>'+pct(c.precision)+'</td><td>'+pct(c.recall)+'</td><td>'+pct(c.f1)+'</td>'
+      +'<td>'+pct(accOf(c))+'</td><td>'+c.ap50.toFixed(3)+'</td></tr>';
   });
   h+='<tr class="total"><td>ALL</td><td>'+(o.gt||0)+'</td><td>'+(o.tp||0)+'</td><td>'+(o.fp||0)+'</td><td>'+(o.fn||0)+'</td>'
-    +'<td>'+pct(o.precision||0)+'</td><td>'+pct(o.recall||0)+'</td><td>'+pct(o.f1||0)+'</td><td>'+(o.map50||0).toFixed(3)+'</td></tr>';
+    +'<td>'+pct(o.precision||0)+'</td><td>'+pct(o.recall||0)+'</td><td>'+pct(o.f1||0)+'</td>'
+    +'<td>'+pct(accOf(o))+'</td><td>'+(o.map50||0).toFixed(3)+'</td></tr>';
   h+='</tbody></table>';
   document.getElementById('valresult').innerHTML=h;
   valShowResult();
