@@ -44,19 +44,36 @@ my_dataset/
 ## Install
 
 ```bash
-pip install flask                 # required
-pip install ultralytics           # optional: automatic annotation
-pip install cvat-sdk python-dotenv # optional: CVAT upload
+npm run setup            # = pip install -r requirements.txt
+```
+
+or install by hand:
+
+```bash
+pip install flask requests         # required
+pip install ultralytics            # optional: auto-annotation + model validation
+pip install cvat-sdk python-dotenv # optional: CVAT import / upload / validation
 ```
 
 ## Run
 
 ```bash
-python3 annotation_app.py
-# then open http://127.0.0.1:5000
+npm run dev      # dev server — auto-reloads whenever you save the file
+npm start        # plain run, no reloader
 ```
 
-The last-used folder is remembered between launches.
+Both open on <http://127.0.0.1:5000>. Under the hood they're just
+`python3 annotation_app.py [--dev]`, so you can run that directly too.
+
+Pick a different port (or host):
+
+```bash
+npm run dev -- --port 5001
+PORT=5001 npm start
+```
+
+The last-used folder — and the image and class you were on — are remembered
+between launches.
 
 ## Automatic annotation (optional)
 

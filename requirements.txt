@@ -1,0 +1,11 @@
+# core — the app will not start without these
+flask
+requests
+
+# CVAT: import tasks, upload/update annotations, class count, model validation
+cvat-sdk
+python-dotenv
+
+# model inference: automatic annotation + model validation
+# (heavy — pulls in torch; skip it if you only annotate locally)
+ultralytics

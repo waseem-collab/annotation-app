@@ -9,3 +9,5 @@ __pycache__/
 imports/
 validation/
 .val_last.json
+node_modules/
+package-lock.json

@@ -1,0 +1,13 @@
+{
+  "name": "annotation-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Annotation Studio — a single-file Flask app for YOLO annotation, CVAT import/upload, auto-annotation and model validation.",
+  "scripts": {
+    "dev": "python3 annotation_app.py --dev",
+    "start": "python3 annotation_app.py",
+    "setup": "pip install -r requirements.txt"
+  },
+  "keywords": ["yolo", "annotation", "cvat", "computer-vision"],
+  "license": "MIT"
+}

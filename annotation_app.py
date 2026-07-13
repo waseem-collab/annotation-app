@@ -5292,9 +5292,23 @@ VARIANTS.forEach(v=>{
 
 
 if __name__ == "__main__":
-    print(f"Images dir : {IMG_DIR}")
-    print(f"Labels dir : {LBL_DIR}")
-    print(f"Classes    : {CLASSES if CLASSES else '(none — add labels.txt)'}")
-    print(f"Found {len(IMAGES)} images.")
-    print("Open http://127.0.0.1:5000 in your browser.")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    import argparse
+    ap = argparse.ArgumentParser(description="Annotation Studio")
+    ap.add_argument("--dev", action="store_true",
+                    help="dev mode: auto-reload on save + verbose errors")
+    ap.add_argument("--host", default=os.getenv("HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "5000")))
+    args = ap.parse_args()
+
+    # the reloader imports this module twice; only the worker process prints
+    if not args.dev or os.getenv("WERKZEUG_RUN_MAIN") == "true":
+        print(f"Images dir : {IMG_DIR}")
+        print(f"Labels dir : {LBL_DIR}")
+        print(f"Classes    : {CLASSES if CLASSES else '(none — add labels.txt)'}")
+        print(f"Found {len(IMAGES)} images.")
+        if args.dev:
+            print("Dev mode — the server restarts whenever you save the file.")
+        print(f"Open http://{args.host}:{args.port} in your browser.")
+
+    app.run(host=args.host, port=args.port,
+            debug=args.dev, use_reloader=args.dev, threaded=True)
