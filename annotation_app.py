@@ -2939,7 +2939,9 @@ HTML = r"""<!DOCTYPE html>
   .vcchip-n{font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;}
   .vc-empty{color:var(--text-muted);font-size:12.5px;padding:6px 2px;}
   /* minimized auto-annotation: floating progress pill (above everything) */
-  .apw{position:fixed;right:18px;bottom:18px;width:300px;z-index:210;background:var(--surface);
+  .jobstack{position:fixed;right:18px;bottom:18px;z-index:210;width:312px;
+    display:none;flex-direction:column;gap:10px;}
+  .apw{width:100%;box-sizing:border-box;background:var(--surface);
     border:1px solid var(--border-2);border-radius:var(--r-lg);box-shadow:var(--sh-lg);
     padding:12px 13px;animation:ddrop .14s ease-out;}
   .apw-top{display:flex;align-items:center;gap:8px;margin-bottom:9px;}
@@ -2978,7 +2980,10 @@ HTML = r"""<!DOCTYPE html>
   .modal .selrow > button:hover{background:var(--surface-2);color:var(--text);}
   .modal-f{padding:14px 18px;border-top:1px solid var(--border);display:flex;
            justify-content:flex-end;gap:9px;}
-  .modal-f button#apmin{display:inline-flex;align-items:center;gap:6px;}
+  .modal-f button.minbtn{display:inline-flex;align-items:center;gap:7px;font-weight:600;
+    background:var(--accent-soft);color:var(--accent);border-color:transparent;}
+  .modal-f button.minbtn:hover{background:var(--accent-soft);border-color:var(--accent);
+    box-shadow:var(--ring);}
   .modal-f button{padding:9px 18px;border-radius:var(--r);border:1px solid var(--border);
                   background:transparent;color:var(--text);cursor:pointer;font-size:13px;font-weight:500;
                   transition:background .15s,border-color .15s;}
@@ -3169,15 +3174,15 @@ HTML = r"""<!DOCTYPE html>
         <div class="hc-title">Class count</div>
         <div class="hc-desc">Count annotations per class in a CVAT project — project-wide and broken down by task.</div>
       </div>
-      <div class="home-card cmp" onclick="enterCmp()">
-        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M6 8H3l3-5 3 5H6zm0 0v6a2 2 0 0 0 2 2h1"/><path d="M18 8h-3l3-5 3 5h-3zm0 0v6a2 2 0 0 1-2 2h-1"/></svg></div>
-        <div class="hc-title">Model comparison</div>
-        <div class="hc-desc">Drop <b>two</b> models and score them head&#8209;to&#8209;head on the same ground truth &mdash; deltas, who finds what, and images side by side.</div>
-      </div>
       <div class="home-card val" onclick="enterVal()">
         <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6.5v5c0 4.6 3.4 8.6 8 9.5 4.6-.9 8-4.9 8-9.5v-5z"/><path d="m9 12 2 2 4-4"/></svg></div>
         <div class="hc-title">Model validation</div>
         <div class="hc-desc">Drop a <b>.pt</b> model and score it against a CVAT ground-truth project — precision, recall, F1, mAP. Read-only: the project is never changed.</div>
+      </div>
+      <div class="home-card cmp" onclick="enterCmp()">
+        <div class="hc-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M6 8H3l3-5 3 5H6zm0 0v6a2 2 0 0 0 2 2h1"/><path d="M18 8h-3l3-5 3 5h-3zm0 0v6a2 2 0 0 1-2 2h-1"/></svg></div>
+        <div class="hc-title">Model comparison</div>
+        <div class="hc-desc">Drop <b>two</b> models and score them head&#8209;to&#8209;head on the same ground truth &mdash; deltas, who finds what, and images side by side.</div>
       </div>
     </div>
   </div>
@@ -3461,7 +3466,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="modal-f">
       <button id="apcancel" onclick="closeApModal()">Cancel</button>
-      <button id="apmin" onclick="minimizeAuto()" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg>Minimize</button>
+      <button id="apmin" class="minbtn" onclick="minimizeJob('ap')" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>Minimize</button>
       <button id="apback" onclick="apShowConfig()" style="display:none;">Back</button>
       <button id="apnext" class="ok" onclick="apNext()">Next</button>
       <button id="aprun" class="ok" onclick="runAutoPipeline()" style="display:none;">Run</button>
@@ -3539,7 +3544,7 @@ HTML = r"""<!DOCTYPE html>
         <div id="valprogtext" style="font-size:13px;color:var(--text);margin-top:8px;"></div>
       </div>
       <div class="modal-f">
-        <button onclick="minimizeJob('val')"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>Minimize</button>
+        <button class="minbtn" onclick="minimizeJob('val')"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>Minimize</button>
       </div>
     </div>
   </div>
@@ -3647,7 +3652,7 @@ HTML = r"""<!DOCTYPE html>
         <div id="cmpprogtext" style="font-size:13px;color:var(--text);margin-top:8px;"></div>
       </div>
       <div class="modal-f">
-        <button onclick="minimizeJob('cmp')"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>Minimize</button>
+        <button class="minbtn" onclick="minimizeJob('cmp')"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>Minimize</button>
       </div>
     </div>
   </div>
@@ -3687,29 +3692,8 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div id="jobwidget" class="apw" style="display:none;">
-  <div class="apw-top">
-    <span class="apw-dot"></span>
-    <span class="apw-title" id="jwTitle">Working…</span>
-    <span class="spacer"></span>
-    <button class="apw-icon" onclick="jwRestore()" title="open full view"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
-    <button class="apw-icon" onclick="jwDismiss()" title="hide"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
-  </div>
-  <div class="apw-bar"><div id="jwBar"></div></div>
-  <div id="jwText" class="apw-text"></div>
-</div>
+<div id="jobstack" class="jobstack"></div>
 
-<div id="apwidget" class="apw" style="display:none;">
-  <div class="apw-top">
-    <span class="apw-dot"></span>
-    <span class="apw-title">Auto-annotating…</span>
-    <span class="spacer"></span>
-    <button class="apw-icon" onclick="restoreAuto()" title="open full view"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
-    <button class="apw-icon" onclick="dismissAutoWidget()" title="hide"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
-  </div>
-  <div class="apw-bar"><div id="apwbar"></div></div>
-  <div id="apwtext" class="apw-text"></div>
-</div>
 
 <script>
 let idx = 0, count = 0, name = "";
@@ -3787,29 +3771,52 @@ function toggleTheme(){
   try{ localStorage.setItem('theme', next); }catch(e){}   // remember the last choice
   updateThemeIcons();
 }
-// ---- minimize a running validation / comparison to a floating pill ----
-let jwOwner=null;
-function jwShow(on){ const w=document.getElementById('jobwidget'); if(w) w.style.display=on?'block':'none'; }
-function jwSet(pct, text, done, title){
-  const bar=document.getElementById('jwBar'), t=document.getElementById('jwText'),
-        w=document.getElementById('jobwidget'), h=document.getElementById('jwTitle');
-  if(bar) bar.style.width=Math.max(0,Math.min(100,pct))+'%';
-  if(t) t.textContent=text||'';
-  if(h) h.textContent=title||'Working…';
-  if(w) w.classList.toggle('done', !!done);
+// ---- minimized jobs: several can be collapsed at once, stacked bottom-right ----
+const JOB_DEF={
+  val:{title:'Validating…',        done:'Validation done',      view:'valview'},
+  cmp:{title:'Comparing models…',  done:'Comparison done',      view:'cmpview'},
+  ap: {title:'Auto-annotating…',   done:'Auto-annotation done', view:'apmodal'}
+};
+const _JW_EXPAND='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>';
+const _JW_X='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+let jobs={};                       // key -> {pct, text, done}
+function renderJobs(){
+  const st=document.getElementById('jobstack'); if(!st) return;
+  const keys=Object.keys(jobs);
+  st.style.display = keys.length ? 'flex' : 'none';
+  st.innerHTML = keys.map(k=>{
+    const j=jobs[k], d=JOB_DEF[k]||{};
+    return '<div class="apw'+(j.done?' done':'')+'">'
+      +'<div class="apw-top"><span class="apw-dot"></span>'
+      +'<span class="apw-title">'+escapeHtml(j.done?(d.done||'Done'):(d.title||'Working…'))+'</span>'
+      +'<span class="spacer"></span>'
+      +'<button class="apw-icon" onclick="jobRestore(\''+k+'\')" title="open full view">'+_JW_EXPAND+'</button>'
+      +'<button class="apw-icon" onclick="jobDismiss(\''+k+'\')" title="hide">'+_JW_X+'</button>'
+      +'</div>'
+      +'<div class="apw-bar"><div style="width:'+Math.max(0,Math.min(100,j.pct||0))+'%"></div></div>'
+      +'<div class="apw-text">'+escapeHtml(j.text||'')+'</div></div>';
+  }).join('');
 }
-function minimizeJob(who){
-  jwOwner=who;
-  document.getElementById(who==='cmp'?'cmpview':'valview').style.display='none';
-  jwShow(true);
+function minimizeJob(k){
+  const d=JOB_DEF[k]; if(!d) return;
+  jobs[k]=jobs[k]||{pct:0,text:'starting…',done:false};
+  const v=document.getElementById(d.view); if(v) v.style.display='none';
+  renderJobs();
+  goHome();                        // back to the cards, with the job pinned bottom-right
 }
-function jwRestore(){
-  jwShow(false);
-  const id = jwOwner==='cmp' ? 'cmpview' : 'valview';
+function jobUpdate(k,pct,text,done){
+  if(!(k in jobs)) return;         // only tracked while minimized
+  jobs[k]={pct:pct, text:text, done:!!done};
+  renderJobs();
+}
+function jobRestore(k){
+  const d=JOB_DEF[k]; if(!d) return;
+  delete jobs[k]; renderJobs();
   appMode='cvat'; applyMode(); hideAllScreens();
-  document.getElementById(id).style.display='flex';   // whatever card the poll left active
+  const v=document.getElementById(d.view);
+  if(v) v.style.display = (k==='ap') ? 'flex' : 'flex';   // whatever card the poll left active
 }
-function jwDismiss(){ jwShow(false); }
+function jobDismiss(k){ delete jobs[k]; renderJobs(); }
 
 // ---- in-app confirm dialog (replaces the browser's confirm popup) ----
 let _confirmCb=null;
@@ -5046,7 +5053,7 @@ function apShowProgress(){
 async function enterAuto(){
   appMode='cvat'; applyMode();
   hideAllScreens();
-  apMinimized=false; apShowWidget(false);   // full view -> no floating widget
+  jobDismiss('ap');                        // full view -> drop its pill
   document.getElementById('apmodal').style.display='flex';
   apMsg(''); apShowConfig();
   document.getElementById('aptasklist').innerHTML='<div class="apt-empty">— select a project first —</div>';
@@ -5061,30 +5068,10 @@ function closeApModal(){
   document.getElementById('apmodal').style.display='none';
   goHome();                 // standalone flow: return to the landing screen
 }
-// ---- minimize the running pipeline to a floating widget ----
-let apMinimized=false;
-function apShowWidget(on){ const w=document.getElementById('apwidget'); if(w) w.style.display=on?'block':'none'; }
-function apSetWidget(pct,text,done){
-  const bar=document.getElementById('apwbar'), t=document.getElementById('apwtext'), w=document.getElementById('apwidget');
-  if(bar) bar.style.width=Math.max(0,Math.min(100,pct))+'%';
-  if(t) t.textContent=text||'';
-  if(w){ w.classList.toggle('done',!!done);
-    w.querySelector('.apw-title').textContent = done ? 'Auto-annotation done' : 'Auto-annotating…'; }
-}
-function minimizeAuto(){
-  apMinimized=true;
-  document.getElementById('apmodal').style.display='none';   // reveal whatever is behind (editor)
-  apShowWidget(true);
-}
-function restoreAuto(){
-  apMinimized=false;
-  apShowWidget(false);
-  appMode='cvat'; applyMode();
-  hideAllScreens();
-  document.getElementById('apmodal').style.display='flex';
-  apShowProgress();
-}
-function dismissAutoWidget(){ apMinimized=false; apShowWidget(false); }
+// auto-annotation shares the same minimized-job stack
+function apSetWidget(pct,text,done){ jobUpdate('ap', pct, text, done); }
+function restoreAuto(){ jobRestore('ap'); }
+function dismissAutoWidget(){ jobDismiss('ap'); }
 async function loadApProjects(refresh){
   const sel=document.getElementById('approj'); const prev=sel.value;
   sel.innerHTML='<option value="">loading…</option>';
@@ -5303,7 +5290,7 @@ async function enterVal(){
   hideAllScreens();
   document.getElementById('valview').style.display='flex';
   valShowCfg();
-  jwShow(false);                  // full view -> no floating pill
+  jobDismiss('val');              // full view -> drop its pill
   valHistCount();                 // badge on the History button
   await valLoadProjects();
   let s=null;
@@ -5655,8 +5642,7 @@ function pollValidation(){
     let t=s.message||s.state||'';
     if(s.running && s.total) t+=' ('+s.done+'/'+s.total+')';
     document.getElementById('valprogtext').textContent=t;
-    jwSet(s.total?Math.round(s.done/s.total*100):(s.running?4:100), t, !s.running,
-          s.running?'Validating…':'Validation done');
+    jobUpdate('val', s.total?Math.round(s.done/s.total*100):(s.running?4:100), t, !s.running);
     if(!s.running){
       clearInterval(valPoll);
       if(s.error) return;                       // leave the error shown
@@ -5816,7 +5802,7 @@ function cmpShowResult(){ _cmpCard('result'); }
 async function enterCmp(){
   appMode='cvat'; applyMode(); hideAllScreens();
   document.getElementById('cmpview').style.display='flex';
-  cmpShowCfg(); jwShow(false); cmpHistCount();
+  cmpShowCfg(); jobDismiss('cmp'); cmpHistCount();
   await cmpLoadProjects();
   let s=null; try{ s=await fetch('/api/cmp/status?t='+Date.now()).then(r=>r.json()); }catch(e){}
   if(!s) return;
@@ -5969,8 +5955,7 @@ function pollCompare(){
     let t=s.message||s.state||'';
     if(s.running && s.total) t+=' ('+s.done+'/'+s.total+')';
     document.getElementById('cmpprogtext').textContent=t;
-    jwSet(s.total?Math.round(s.done/s.total*100):(s.running?4:100), t, !s.running,
-          s.running?'Comparing models…':'Comparison done');
+    jobUpdate('cmp', s.total?Math.round(s.done/s.total*100):(s.running?4:100), t, !s.running);
     if(!s.running){
       clearInterval(cmpPoll);
       if(s.error) return;
