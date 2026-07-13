@@ -1798,32 +1798,57 @@ def _average_precision(dets, n_gt):
 
 _val_job = {"running": False, "state": "idle", "message": "", "done": 0, "total": 0,
             "cur_task": 0, "n_tasks": 0, "result": None, "error": None,
-            "config": None, "finished_at": None}
+            "config": None, "finished_at": None, "run_id": None}
 _val_lock = threading.Lock()
 
-# the last completed run (config + result) is kept on disk so it survives a restart
-VAL_LAST_FILE = os.path.join(BASE, ".val_last.json")
+# every completed run (config + result) is kept on disk, newest first
+VAL_HIST_FILE = os.path.join(BASE, ".val_history.json")
+VAL_LAST_FILE = os.path.join(BASE, ".val_last.json")     # legacy (migrated below)
+VAL_HIST_MAX = 30
 
 
-def _save_val_last(config, result, finished_at):
+def _load_val_history():
     try:
-        with open(VAL_LAST_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"config": config, "result": result,
-                       "finished_at": finished_at}, fh)
+        with open(VAL_HIST_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_val_history(hist):
+    try:
+        with open(VAL_HIST_FILE, "w", encoding="utf-8") as fh:
+            json.dump(hist[:VAL_HIST_MAX], fh)
     except OSError:
         pass
 
 
-def _load_val_last():
-    try:
-        with open(VAL_LAST_FILE, encoding="utf-8") as fh:
-            d = json.load(fh)
-    except (OSError, ValueError):
-        return
-    if d.get("result"):
-        _val_job.update(result=d["result"], config=d.get("config"),
-                        finished_at=d.get("finished_at"), state="done",
-                        message="last run (restored)")
+def _append_val_history(run_id, config, result, finished_at):
+    hist = _load_val_history()
+    hist.insert(0, {"id": run_id, "finished_at": finished_at,
+                    "config": config, "result": result})
+    _save_val_history(hist)
+
+
+def _restore_last_val():
+    """Seed the job with the newest run so the page shows it after a restart."""
+    hist = _load_val_history()
+    if not hist:                                   # migrate the old single-run file
+        try:
+            with open(VAL_LAST_FILE, encoding="utf-8") as fh:
+                d = json.load(fh)
+            if d.get("result"):
+                _append_val_history(str(d.get("finished_at") or "legacy"),
+                                    d.get("config"), d["result"], d.get("finished_at"))
+                hist = _load_val_history()
+        except (OSError, ValueError):
+            pass
+    if hist:
+        h = hist[0]
+        _val_job.update(result=h.get("result"), config=h.get("config"),
+                        finished_at=h.get("finished_at"), run_id=h.get("id"),
+                        state="done", message="last run (restored)")
 
 VAL_INFER_CONF = 0.01      # infer low so the PR curve (AP) is meaningful
 
@@ -1939,11 +1964,12 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                   "model": os.path.basename(model_path), "project_id": project_id}
         import time
         finished_at = time.strftime("%Y-%m-%d %H:%M")
+        run_id = str(int(time.time() * 1000))
         _set_val(running=False, state="done", result=result, config=config,
-                 finished_at=finished_at,
+                 finished_at=finished_at, run_id=run_id,
                  message=f"done ✓ — {n_images} images, mAP@50 "
                          f"{(sum_ap/n_present if n_present else 0):.3f}")
-        _save_val_last(config, result, finished_at)     # survives a restart
+        _append_val_history(run_id, config, result, finished_at)   # keep in history
     except Exception as e:
         _set_val(running=False, state="error", error=str(e), message=f"validation failed: {e}")
 
@@ -1963,6 +1989,37 @@ def api_val_upload_model():
     rel = os.path.relpath(dest, MODELS_DIR)
     return jsonify({"ok": True, "path": rel, "name": safe,
                     "size": os.path.getsize(dest)})
+
+
+@app.route("/api/val/models")
+def api_val_models():
+    """Previously uploaded .pt files (so you can reuse or delete them)."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(UPLOAD_MODELS_DIR, "*.pt"))):
+        out.append({"name": os.path.basename(p),
+                    "path": os.path.relpath(p, MODELS_DIR),
+                    "size": os.path.getsize(p)})
+    return jsonify({"models": out})
+
+
+@app.route("/api/val/delete_model", methods=["POST"])
+def api_val_delete_model():
+    """Delete an UPLOADED model. Only files under MODELS_DIR/_uploaded can be
+    removed — models you keep in models/ yourself are never touched."""
+    rel = (request.get_json(force=True, silent=True) or {}).get("path", "")
+    full = _safe_model_path(rel)
+    if not full:
+        return jsonify({"error": "model not found"}), 404
+    up = os.path.abspath(UPLOAD_MODELS_DIR)
+    if os.path.commonpath([up, os.path.abspath(full)]) != up:
+        return jsonify({"error": "only uploaded models can be deleted"}), 400
+    try:
+        os.remove(full)
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+    with _models_lock:                       # drop it from the loaded-model cache
+        _models_cache.pop(full, None)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/val/run", methods=["POST"])
@@ -2015,7 +2072,39 @@ def api_val_status():
         return jsonify(dict(_val_job))
 
 
-_load_val_last()          # restore the last completed run on startup
+@app.route("/api/val/history")
+def api_val_history():
+    """Light summaries of past runs, newest first."""
+    out = []
+    for h in _load_val_history():
+        r = h.get("result") or {}
+        o = r.get("overall") or {}
+        c = h.get("config") or {}
+        out.append({"id": h.get("id"), "finished_at": h.get("finished_at"),
+                    "model": r.get("model") or c.get("model_name"),
+                    "project_id": r.get("project_id"), "tasks": r.get("tasks"),
+                    "images": r.get("images"), "conf": r.get("conf"), "iou": r.get("iou"),
+                    "map50": o.get("map50"), "precision": o.get("precision"),
+                    "recall": o.get("recall"), "f1": o.get("f1")})
+    return jsonify({"runs": out})
+
+
+@app.route("/api/val/history/<run_id>")
+def api_val_history_one(run_id):
+    for h in _load_val_history():
+        if str(h.get("id")) == str(run_id):
+            return jsonify(h)
+    return jsonify({"error": "run not found"}), 404
+
+
+@app.route("/api/val/history/<run_id>", methods=["DELETE"])
+def api_val_history_delete(run_id):
+    hist = [h for h in _load_val_history() if str(h.get("id")) != str(run_id)]
+    _save_val_history(hist)
+    return jsonify({"ok": True, "runs": len(hist)})
+
+
+_restore_last_val()       # restore the newest run on startup
 
 
 @app.route("/")
@@ -2269,6 +2358,16 @@ HTML = r"""<!DOCTYPE html>
     font-size:12.5px;color:var(--text);}
   .val-model .vm-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .val-model .vm-size{color:var(--text-muted);flex:none;margin-left:auto;}
+  .val-model .vm-del{flex:none;width:24px;height:24px;display:flex;align-items:center;justify-content:center;
+    background:transparent;border:1px solid transparent;border-radius:6px;color:var(--text-muted);
+    cursor:pointer;transition:background .12s,color .12s,border-color .12s;}
+  .val-model .vm-del:hover{background:var(--danger-soft);color:var(--danger);border-color:var(--danger-border);}
+  table.valtab tr.histrow{cursor:pointer;}
+  table.valtab tr.histrow:hover td{background:var(--accent-soft);}
+  .histdel{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;
+    background:transparent;border:1px solid transparent;border-radius:6px;color:var(--text-dim);
+    cursor:pointer;transition:background .12s,color .12s,border-color .12s;}
+  .histdel:hover{background:var(--danger-soft);color:var(--danger);border-color:var(--danger-border);}
   .val-two{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
   .val-result{flex:1;overflow:auto;padding:22px 24px;}
   .val-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px;}
@@ -2846,6 +2945,7 @@ HTML = r"""<!DOCTYPE html>
     <span class="browse-title">Model validation</span>
     <span class="val-ro"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>read-only &mdash; the CVAT project is never modified</span>
     <span class="spacer"></span>
+    <button id="valhistbtn" onclick="valShowHistory()"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>History <span id="valhistn" class="aptaskcount"></span></button>
     <button id="valagain" onclick="valShowCfg()" style="display:none;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>New run</button>
   </div>
   <div class="val-page">
@@ -2902,6 +3002,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
   <div id="valresult" class="val-result" style="display:none;"></div>
+  <div id="valhistview" class="val-result" style="display:none;"></div>
 </div>
 
 <div id="confirmModal" class="modal-bg" style="z-index:400;">
@@ -4478,23 +4579,21 @@ async function enterVal(){
   hideAllScreens();
   document.getElementById('valview').style.display='flex';
   valShowCfg();
+  valHistCount();                 // badge on the History button
   await valLoadProjects();
   let s=null;
   try{ s=await fetch('/api/val/status?t='+Date.now()).then(r=>r.json()); }catch(e){}
   if(!s) return;
-  if(s.config){ valLastConfig=s.config; await valPrefill(s.config); }   // remember last run's settings
+  // pre-fill the form with the last run's settings, but stay on the config screen —
+  // past results are reached through the History button, not shown automatically.
+  if(s.config){ valLastConfig=s.config; await valPrefill(s.config); }
   if(s.running){ valShowProg(); pollValidation(); }
-  else if(s.result){ renderValResult(s.result, s.finished_at); }        // and its results
 }
 // restore the previous run's model / project / tasks / thresholds into the form
 async function valPrefill(cfg){
   try{
     valModel={path:cfg.model, name:cfg.model_name};
-    const b=document.getElementById('valmodel');
-    b.innerHTML='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ok);flex:none;"><polyline points="20 6 9 17 4 12"/></svg>'
-      +'<span class="vm-name">'+escapeHtml(cfg.model_name||'')+'</span>'
-      +'<span class="vm-size">last used</span>';
-    b.style.display='flex';
+    valModelChip(cfg.model_name, 'last used');
     if(cfg.conf!=null) document.getElementById('valconf').value=cfg.conf;
     if(cfg.iou!=null) document.getElementById('valiou').value=cfg.iou;
     const sel=document.getElementById('valproj');
@@ -4506,33 +4605,65 @@ async function valPrefill(cfg){
     valTaskCount();
   }catch(e){}
 }
-function valShowCfg(){
-  document.getElementById('valcfg').style.display='';
-  document.getElementById('valmapcard').style.display='none';
-  document.getElementById('valprogcard').style.display='none';
-  document.getElementById('valresult').style.display='none';
-  document.querySelector('.val-page').style.display='flex';
-  document.getElementById('valagain').style.display='none';
-  valMsg('');
+function _valCard(which){          // which: cfg | map | prog | result | hist
+  document.getElementById('valcfg').style.display     = which==='cfg' ?'':'none';
+  document.getElementById('valmapcard').style.display = which==='map' ?'':'none';
+  document.getElementById('valprogcard').style.display= which==='prog'?'':'none';
+  document.querySelector('.val-page').style.display   = ['cfg','map','prog'].includes(which)?'flex':'none';
+  document.getElementById('valresult').style.display  = which==='result'?'block':'none';
+  document.getElementById('valhistview').style.display= which==='hist'  ?'block':'none';
+  document.getElementById('valagain').style.display   = ['result','hist'].includes(which)?'':'none';
 }
-function valShowMap(){
-  document.getElementById('valcfg').style.display='none';
-  document.getElementById('valmapcard').style.display='';
-  document.getElementById('valprogcard').style.display='none';
-  document.getElementById('valresult').style.display='none';
-  document.querySelector('.val-page').style.display='flex';
+function valShowCfg(){ _valCard('cfg'); valMsg(''); }
+function valShowMap(){ _valCard('map'); }
+function valShowProg(){ _valCard('prog'); }
+function valShowResult(){ _valCard('result'); }
+// ---- run history ----
+async function valHistCount(){
+  try{
+    const r=await fetch('/api/val/history?t='+Date.now()).then(r=>r.json());
+    const n=(r.runs||[]).length;
+    const e=document.getElementById('valhistn'); if(e) e.textContent=n?('· '+n):'';
+    return r.runs||[];
+  }catch(e){ return []; }
 }
-function valShowProg(){
-  document.getElementById('valcfg').style.display='none';
-  document.getElementById('valmapcard').style.display='none';
-  document.getElementById('valprogcard').style.display='';
-  document.getElementById('valresult').style.display='none';
-  document.querySelector('.val-page').style.display='flex';
+async function valShowHistory(){
+  const host=document.getElementById('valhistview');
+  host.innerHTML='<div class="browse-empty">loading history…</div>';
+  _valCard('hist');
+  const runs=await valHistCount();
+  if(!runs.length){ host.innerHTML='<div class="browse-empty">No past runs yet — validate a model and it will show up here.</div>'; return; }
+  let h='<div class="val-sub">'+runs.length+' past run(s) — newest first. Click one to view its full report.</div>';
+  h+='<table class="valtab"><thead><tr><th>When</th><th>Model</th><th>Project</th><th>Tasks</th>'
+    +'<th>Images</th><th>conf / IoU</th><th>mAP@50</th><th>Precision</th><th>Recall</th><th>F1</th><th></th></tr></thead><tbody>';
+  runs.forEach(r=>{
+    h+='<tr class="histrow" onclick="valOpenRun(\''+r.id+'\')">'
+      +'<td>'+escapeHtml(r.finished_at||'')+'</td>'
+      +'<td>'+escapeHtml(r.model||'')+'</td>'
+      +'<td>'+escapeHtml(String(r.project_id||''))+'</td>'
+      +'<td>'+(r.tasks||0)+'</td><td>'+(r.images||0)+'</td>'
+      +'<td class="dim">'+r.conf+' / '+r.iou+'</td>'
+      +'<td><b>'+(r.map50||0).toFixed(3)+'</b></td>'
+      +'<td>'+pct(r.precision||0)+'</td><td>'+pct(r.recall||0)+'</td><td>'+pct(r.f1||0)+'</td>'
+      +'<td><button class="histdel" title="delete this run" onclick="event.stopPropagation();valDeleteRun(\''+r.id+'\')">'
+      +'<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button></td></tr>';
+  });
+  h+='</tbody></table>';
+  host.innerHTML=h;
 }
-function valShowResult(){
-  document.querySelector('.val-page').style.display='none';
-  document.getElementById('valresult').style.display='block';
-  document.getElementById('valagain').style.display='';
+async function valOpenRun(id){
+  try{
+    const h=await fetch('/api/val/history/'+encodeURIComponent(id)+'?t='+Date.now()).then(r=>r.json());
+    if(h.error){ return; }
+    if(h.config) valLastConfig=h.config;
+    renderValResult(h.result, h.finished_at);
+  }catch(e){}
+}
+async function valDeleteRun(id){
+  if(!(await appConfirm('Delete this validation run from the history?',
+       {title:'Delete run', ok:'Delete', danger:true}))) return;
+  try{ await fetch('/api/val/history/'+encodeURIComponent(id),{method:'DELETE'}); }catch(e){}
+  valShowHistory();
 }
 // ---- .pt drop zone ----
 (function(){
@@ -4543,6 +4674,35 @@ function valShowResult(){
     e.preventDefault(); e.stopPropagation(); dz.classList.remove('over'); }));
   dz.addEventListener('drop',e=>{ const f=e.dataTransfer.files && e.dataTransfer.files[0]; if(f) valPickFile(f); });
 })();
+// show the picked model; the delete button only appears for models uploaded here
+// (a model from your own models/ folder is never deletable from the UI)
+function valModelChip(name, note){
+  const box=document.getElementById('valmodel');
+  const uploaded = !!(valModel && valModel.path && String(valModel.path).replace(/\\\\/g,'/').indexOf('_uploaded/')===0);
+  box.innerHTML='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ok);flex:none;"><polyline points="20 6 9 17 4 12"/></svg>'
+    +'<span class="vm-name">'+escapeHtml(name||'')+'</span>'
+    +'<span class="vm-size">'+escapeHtml(note||'')+'</span>'
+    +(uploaded ? '<button class="vm-del" title="delete this uploaded model" onclick="valDeleteModel()">'
+      +'<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>' : '');
+  box.style.display='flex';
+}
+function valClearModel(){
+  valModel=null;
+  document.getElementById('valmodel').style.display='none';
+  document.getElementById('valfile').value='';
+}
+async function valDeleteModel(){
+  if(!valModel) return;
+  if(!(await appConfirm('Delete the uploaded model "'+valModel.name+'" from disk?\\nOnly files you uploaded here are removed.',
+       {title:'Delete model', ok:'Delete', danger:true}))) return;
+  try{
+    const r=await fetch('/api/val/delete_model',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:valModel.path})}).then(r=>r.json());
+    if(r.error){ valMsg('could not delete: '+r.error); return; }
+    valClearModel();
+    valMsg('model deleted — drop another .pt to validate');
+  }catch(e){ valMsg('delete failed'); }
+}
 async function valPickFile(f){
   if(!f) return;
   if(!f.name.toLowerCase().endsWith('.pt')){ valMsg('that is not a .pt file'); return; }
@@ -4552,11 +4712,7 @@ async function valPickFile(f){
     const r=await fetch('/api/val/upload_model',{method:'POST',body:fd}).then(r=>r.json());
     if(r.error){ valMsg('upload failed: '+r.error); return; }
     valModel={path:r.path, name:r.name};
-    const box=document.getElementById('valmodel');
-    box.innerHTML='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ok);flex:none;"><polyline points="20 6 9 17 4 12"/></svg>'
-      +'<span class="vm-name">'+escapeHtml(r.name)+'</span>'
-      +'<span class="vm-size">'+(r.size/1048576).toFixed(1)+' MB</span>';
-    box.style.display='flex';
+    valModelChip(r.name, (r.size/1048576).toFixed(1)+' MB');
     valMsg('');
   }catch(e){ valMsg('upload failed'); }
 }
@@ -4667,7 +4823,7 @@ function pollValidation(){
       clearInterval(valPoll);
       if(s.error) return;                       // leave the error shown
       if(s.config) valLastConfig=s.config;
-      if(s.result) renderValResult(s.result, s.finished_at);
+      if(s.result){ renderValResult(s.result, s.finished_at); valHistCount(); }
     }
   }, 1000);
 }

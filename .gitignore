@@ -11,3 +11,4 @@ validation/
 .val_last.json
 node_modules/
 package-lock.json
+.val_history.json
