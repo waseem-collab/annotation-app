@@ -2227,9 +2227,22 @@ def api_val_image():
 _restore_last_val()       # restore the newest run on startup
 
 
+# Changes with every server (re)start, so the page can tell it is stale.
+_BOOT_ID = f"{os.path.getmtime(os.path.abspath(__file__))}-{os.getpid()}"
+
+
+@app.route("/api/dev/version")
+def api_dev_version():
+    """In dev mode the page polls this; when the id changes the server has
+    restarted (you saved the file) and the browser reloads itself."""
+    return jsonify({"dev": bool(app.debug), "v": _BOOT_ID})
+
+
 @app.route("/")
 def index():
-    return Response(HTML, mimetype="text/html")
+    resp = Response(HTML, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store, must-revalidate"   # never serve a stale page
+    return resp
 
 
 @app.route("/demo")
@@ -3271,6 +3284,24 @@ function setFillOpacity(v){
   const e=document.getElementById('fillopval'); if(e) e.textContent=fillOpacity+'%';
   draw();              // apply immediately
 }
+// ---- dev live-reload: when the server restarts (because you saved the file),
+// refresh the page so you see the change without touching anything.
+// Outside dev mode this makes one request and then stops for good.
+(function(){
+  let boot=null;
+  async function tick(){
+    let wait=1000;
+    try{
+      const r=await fetch('/api/dev/version?t='+Date.now(),{cache:'no-store'}).then(r=>r.json());
+      if(!r.dev) return;                       // not a dev server -> never poll again
+      if(boot===null) boot=r.v;
+      else if(r.v!==boot){ location.reload(); return; }
+    }catch(e){ wait=400; }                     // mid-restart: retry a little faster
+    setTimeout(tick, wait);
+  }
+  tick();
+})();
+
 // ---- light / dark theme ----
 const _SUN='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
 const _MOON='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
