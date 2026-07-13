@@ -1824,6 +1824,19 @@ def _save_val_history(hist):
         pass
 
 
+def _val_details_path(run_id):
+    return os.path.join(VAL_DIR, "runs", f"{_safe_name(str(run_id))}.json")
+
+
+def _save_val_details(run_id, details):
+    try:
+        os.makedirs(os.path.join(VAL_DIR, "runs"), exist_ok=True)
+        with open(_val_details_path(run_id), "w", encoding="utf-8") as fh:
+            json.dump({"images": details}, fh)
+    except OSError:
+        pass
+
+
 def _append_val_history(run_id, config, result, finished_at):
     hist = _load_val_history()
     hist.insert(0, {"id": run_id, "finished_at": finished_at,
@@ -1866,6 +1879,7 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
         tp = [0] * n_cls
         fp = [0] * n_cls
         det_pool = [[] for _ in range(n_cls)]     # (conf, is_tp) for AP
+        details = []                              # per-image boxes for the class viewer
         n_images = 0
         _set_val(state="loading", message="loading model…", n_tasks=len(task_ids))
         _load_model(model_path)
@@ -1924,14 +1938,27 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                             if v > best:
                                 best, best_j = v, j
                         is_tp = best >= iou_thr and best_j >= 0
+                        pr["tp"] = bool(is_tp)
                         if is_tp:
                             used[best_j] = True
+                            if pr["conf"] >= conf:
+                                g[best_j]["m"] = True       # GT matched at the threshold
                         det_pool[ci].append((pr["conf"], is_tp))       # for AP (all conf)
                         if pr["conf"] >= conf:                          # threshold metrics
                             if is_tp:
                                 tp[ci] += 1
                             else:
                                 fp[ci] += 1
+                # ---- keep per-image detail so the class viewer can show the boxes
+                r5 = lambda v: round(float(v), 5)
+                rec_gt = [[b["cls"], r5(b["cx"]), r5(b["cy"]), r5(b["w"]), r5(b["h"]),
+                           1 if b.get("m") else 0] for b in gts]
+                rec_pd = [[b["cls"], r5(b["cx"]), r5(b["cy"]), r5(b["w"]), r5(b["h"]),
+                           round(float(b["conf"]), 3), 1 if b.get("tp") else 0]
+                          for b in preds if b["conf"] >= conf]
+                if rec_gt or rec_pd:
+                    details.append({"p": os.path.relpath(os.path.join(img_dir, img), VAL_DIR),
+                                    "n": img, "gt": rec_gt, "pd": rec_pd})
             _set_val(done=len(images))
         # ---- assemble metrics
         per_class, sum_ap, n_present = [], 0.0, 0
@@ -1970,6 +1997,7 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
         import time
         finished_at = time.strftime("%Y-%m-%d %H:%M")
         run_id = str(int(time.time() * 1000))
+        _save_val_details(run_id, details)         # boxes for the per-class image viewer
         _set_val(running=False, state="done", result=result, config=config,
                  finished_at=finished_at, run_id=run_id,
                  message=f"done ✓ — {n_images} images, mAP@50 "
@@ -2110,7 +2138,58 @@ def api_val_history_one(run_id):
 def api_val_history_delete(run_id):
     hist = [h for h in _load_val_history() if str(h.get("id")) != str(run_id)]
     _save_val_history(hist)
+    try:
+        os.remove(_val_details_path(run_id))       # drop its per-image detail too
+    except OSError:
+        pass
     return jsonify({"ok": True, "runs": len(hist)})
+
+
+@app.route("/api/val/details/<run_id>")
+def api_val_details(run_id):
+    """Per-image GT + prediction boxes for one class of a run, so the viewer can
+    show what was hit, missed, and falsely detected."""
+    try:
+        with open(_val_details_path(run_id), encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return jsonify({"error": "no per-image detail stored for this run — re-run to enable it"}), 404
+    raw = request.args.get("cls")
+    if raw is None:
+        return jsonify(d)
+    try:
+        ci = int(raw)
+    except ValueError:
+        return jsonify({"error": "bad class"}), 400
+    out = []
+    for r in d.get("images", []):
+        gt = [b for b in r.get("gt", []) if b[0] == ci]
+        pd = [b for b in r.get("pd", []) if b[0] == ci]
+        if not gt and not pd:
+            continue
+        n_tp = sum(1 for b in pd if b[6])
+        out.append({"p": r["p"], "n": r.get("n", ""), "gt": gt, "pd": pd,
+                    "tp": n_tp, "fp": len(pd) - n_tp,
+                    "fn": sum(1 for b in gt if not b[5])})
+    # most interesting first: images with the most mistakes
+    out.sort(key=lambda r: -(r["fp"] + r["fn"]))
+    return jsonify({"cls": ci, "images": out})
+
+
+@app.route("/api/val/image")
+def api_val_image():
+    """Serve a ground-truth image from VAL_DIR (read-only, path-guarded)."""
+    rel = request.args.get("p", "")
+    base = os.path.abspath(VAL_DIR)
+    full = os.path.abspath(os.path.join(VAL_DIR, rel))
+    try:
+        if os.path.commonpath([base, full]) != base:
+            return jsonify({"error": "bad path"}), 400
+    except ValueError:
+        return jsonify({"error": "bad path"}), 400
+    if not os.path.isfile(full):
+        return jsonify({"error": "not found"}), 404
+    return send_file(full)
 
 
 _restore_last_val()       # restore the newest run on startup
@@ -2421,6 +2500,52 @@ HTML = r"""<!DOCTYPE html>
   table.valtab tr:hover td{background:var(--surface-2);}
   table.valtab tr.total td{border-top:2px solid var(--border-2);font-weight:700;background:var(--surface-3);}
   table.valtab td.dim{color:var(--text-dim);}
+  .clslink{background:none;border:none;padding:0;font:inherit;font-weight:700;color:var(--accent);
+    cursor:pointer;text-align:left;border-bottom:1px dashed transparent;}
+  .clslink:hover{border-bottom-color:var(--accent);}
+  /* ---- per-class image viewer ---- */
+  .vc-view{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--bg);}
+  .vc-bar{display:flex;align-items:center;gap:9px;padding:10px 16px;border-bottom:1px solid var(--border);
+    background:var(--surface);flex:none;flex-wrap:wrap;}
+  .vc-bar .spacer{flex:1;}
+  .vc-bar button{display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--text);
+    border:1px solid var(--border);padding:6px 10px;border-radius:var(--r);cursor:pointer;font-size:12.5px;
+    transition:background .12s,border-color .12s;}
+  .vc-bar button:hover{background:var(--surface-2);border-color:var(--border-2);}
+  .vc-title{font-size:15px;font-weight:700;color:var(--text);}
+  .vc-pos{font-size:12.5px;color:var(--text-muted);font-variant-numeric:tabular-nums;min-width:64px;text-align:center;}
+  .vc-filters{display:inline-flex;gap:6px;margin-right:6px;}
+  .vcf{font-size:11.5px !important;padding:5px 9px !important;color:var(--text-muted) !important;}
+  .vcf.on{background:var(--accent-soft) !important;color:var(--accent) !important;border-color:var(--accent) !important;font-weight:600;}
+  .cbadge{display:inline-flex;align-items:center;font-size:10px;font-weight:700;padding:2px 6px;
+    border-radius:999px;margin-left:5px;letter-spacing:.3px;}
+  .cbadge.gt{background:rgba(59,130,246,.16);color:#3b82f6;}
+  .cbadge.tp{background:rgba(34,197,94,.16);color:#16a34a;}
+  .cbadge.fp{background:rgba(239,68,68,.16);color:#ef4444;}
+  .cbadge.fn{background:rgba(245,158,11,.18);color:#d97706;}
+  .lg{width:10px;height:10px;border-radius:3px;display:inline-block;margin-right:5px;flex:none;}
+  .lg.gt{background:#3b82f6;} .lg.tp{background:#22c55e;}
+  .lg.fp{background:#ef4444;} .lg.fn{background:#f59e0b;}
+  .vc-panels{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px 16px;}
+  @media(max-width:1000px){.vc-panels{grid-template-columns:1fr;}}
+  .vc-panel{display:flex;flex-direction:column;min-height:0;background:var(--surface);
+    border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--sh-sm);}
+  .vc-h{display:flex;align-items:center;padding:9px 12px;font-size:11.5px;font-weight:700;
+    text-transform:uppercase;letter-spacing:.4px;color:var(--text-muted);
+    border-bottom:1px solid var(--border);background:var(--surface-2);}
+  .vc-h .vc-n{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:600;color:var(--text-muted);}
+  .vc-cvwrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
+    padding:8px;background:var(--canvas-bg);}
+  .vc-cvwrap canvas{max-width:100%;max-height:100%;border-radius:3px;}
+  .vc-strip{flex:none;display:flex;gap:7px;overflow-x:auto;padding:10px 16px;
+    border-top:1px solid var(--border);background:var(--surface);}
+  .vcchip{flex:none;display:inline-flex;align-items:center;gap:2px;padding:5px 8px;border-radius:999px;
+    background:var(--bg);border:1px solid var(--border);color:var(--text-muted);cursor:pointer;font-size:11px;
+    transition:border-color .12s,background .12s;}
+  .vcchip:hover{border-color:var(--border-2);background:var(--surface-2);}
+  .vcchip.on{border-color:var(--accent);background:var(--accent-soft);}
+  .vcchip-n{font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;}
+  .vc-empty{color:var(--text-muted);font-size:12.5px;padding:6px 2px;}
   /* minimized auto-annotation: floating progress pill (above everything) */
   .apw{position:fixed;right:18px;bottom:18px;width:300px;z-index:210;background:var(--surface);
     border:1px solid var(--border-2);border-radius:var(--r-lg);box-shadow:var(--sh-lg);
@@ -3012,6 +3137,30 @@ HTML = r"""<!DOCTYPE html>
   </div>
   <div id="valresult" class="val-result" style="display:none;"></div>
   <div id="valhistview" class="val-result" style="display:none;"></div>
+
+  <div id="valclsview" class="vc-view" style="display:none;">
+    <div class="vc-bar">
+      <button class="vc-back" onclick="valShowResult()"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Report</button>
+      <span class="vc-title" id="vcTitle"></span>
+      <span class="vc-counts" id="vcCounts"></span>
+      <span class="spacer"></span>
+      <span class="vc-filters" id="vcFilters"></span>
+      <button onclick="vcGo(-1)" title="previous image"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
+      <span id="vcPos" class="vc-pos">0 / 0</span>
+      <button onclick="vcGo(1)" title="next image"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>
+    </div>
+    <div class="vc-panels">
+      <div class="vc-panel">
+        <div class="vc-h"><span class="lg gt"></span>Ground truth <span class="vc-n" id="vcGtN"></span></div>
+        <div class="vc-cvwrap"><canvas id="vcGtCv"></canvas></div>
+      </div>
+      <div class="vc-panel">
+        <div class="vc-h"><span class="lg tp"></span><span class="lg fp"></span><span class="lg fn"></span>Model prediction <span class="vc-n" id="vcPdN"></span></div>
+        <div class="vc-cvwrap"><canvas id="vcPdCv"></canvas></div>
+      </div>
+    </div>
+    <div id="vcStrip" class="vc-strip"></div>
+  </div>
 </div>
 
 <div id="confirmModal" class="modal-bg" style="z-index:400;">
@@ -4582,6 +4731,7 @@ function renderCcTable(res){
 
 // ---- Model validation (read-only against a CVAT ground-truth project) ----
 let valPoll=null, valModel=null, valGtClasses=[], valModelClasses=[], valLastConfig=null;
+let valCurRunId=null, valCurResult=null;   // which run the report on screen belongs to
 function valMsg(t,el){ const e=document.getElementById(el||'valmsg'); if(e) e.textContent=t||''; }
 async function enterVal(){
   appMode='cvat'; applyMode();
@@ -4614,14 +4764,115 @@ async function valPrefill(cfg){
     valTaskCount();
   }catch(e){}
 }
-function _valCard(which){          // which: cfg | map | prog | result | hist
+function _valCard(which){          // which: cfg | map | prog | result | hist | cls
   document.getElementById('valcfg').style.display     = which==='cfg' ?'':'none';
   document.getElementById('valmapcard').style.display = which==='map' ?'':'none';
   document.getElementById('valprogcard').style.display= which==='prog'?'':'none';
   document.querySelector('.val-page').style.display   = ['cfg','map','prog'].includes(which)?'flex':'none';
   document.getElementById('valresult').style.display  = which==='result'?'block':'none';
   document.getElementById('valhistview').style.display= which==='hist'  ?'block':'none';
+  document.getElementById('valclsview').style.display = which==='cls'   ?'flex':'none';
   document.getElementById('valagain').style.display   = ['result','hist'].includes(which)?'':'none';
+}
+// ---- per-class image viewer: ground truth beside what the model predicted ----
+const VC_COL={gt:'#3b82f6', tp:'#22c55e', fp:'#ef4444', fn:'#f59e0b'};
+let vcAll=[], vcImgs=[], vcIdx=0, vcFilter='all';
+function vcBadges(tp,fp,fn){
+  return (tp?'<span class="cbadge tp">TP '+tp+'</span>':'')
+        +(fp?'<span class="cbadge fp">FP '+fp+'</span>':'')
+        +(fn?'<span class="cbadge fn">FN '+fn+'</span>':'');
+}
+async function valOpenClass(ci){
+  if(!valCurRunId || !valCurResult) return;
+  const c=(valCurResult.per_class||[])[ci]; if(!c) return;
+  _valCard('cls');
+  document.getElementById('vcTitle').textContent=c.name;
+  document.getElementById('vcCounts').textContent='loading…';
+  document.getElementById('vcFilters').innerHTML='';
+  vcAll=[]; vcImgs=[]; vcIdx=0; vcFilter='all';
+  try{
+    const r=await fetch('/api/val/details/'+encodeURIComponent(valCurRunId)+'?cls='+ci
+      +'&t='+Date.now()).then(r=>r.json());
+    if(r.error){ document.getElementById('vcCounts').textContent=r.error;
+      document.getElementById('vcStrip').innerHTML=''; vcClear(); return; }
+    vcAll=r.images||[];
+    vcApplyFilter();
+  }catch(e){ document.getElementById('vcCounts').textContent='failed to load'; }
+}
+function vcApplyFilter(){
+  vcImgs = vcAll.filter(r=>{
+    if(vcFilter==='fn') return r.fn>0;
+    if(vcFilter==='fp') return r.fp>0;
+    if(vcFilter==='ok') return r.fp===0 && r.fn===0 && r.tp>0;
+    return true;
+  });
+  const T=vcAll.reduce((a,r)=>({gt:a.gt+r.gt.length, tp:a.tp+r.tp, fp:a.fp+r.fp, fn:a.fn+r.fn}),
+                       {gt:0,tp:0,fp:0,fn:0});
+  document.getElementById('vcCounts').innerHTML=
+    '<span class="cbadge gt">GT '+T.gt+'</span>'+vcBadges(T.tp,T.fp,T.fn);
+  const nFn=vcAll.filter(r=>r.fn>0).length, nFp=vcAll.filter(r=>r.fp>0).length,
+        nOk=vcAll.filter(r=>r.fp===0&&r.fn===0&&r.tp>0).length;
+  document.getElementById('vcFilters').innerHTML=[
+    ['all','All '+vcAll.length], ['fn','Missed '+nFn], ['fp','False alarms '+nFp], ['ok','Perfect '+nOk]
+  ].map(([k,l])=>'<button class="vcf'+(vcFilter===k?' on':'')+'" onclick="vcSetFilter(\''+k+'\')">'
+    +l+'</button>').join('');
+  vcIdx=0; vcShow(0);
+}
+function vcSetFilter(f){ vcFilter=f; vcApplyFilter(); }
+function vcStrip(){
+  const s=document.getElementById('vcStrip');
+  if(!vcImgs.length){ s.innerHTML='<div class="vc-empty">no images match this filter</div>'; return; }
+  s.innerHTML=vcImgs.map((r,i)=>'<button class="vcchip'+(i===vcIdx?' on':'')+'" onclick="vcShow('+i+')" title="'
+    +escapeHtml(r.n||'')+'"><span class="vcchip-n">'+(i+1)+'</span>'+vcBadges(r.tp,r.fp,r.fn)+'</button>').join('');
+  const on=s.querySelector('.vcchip.on'); if(on && on.scrollIntoView) on.scrollIntoView({block:'nearest',inline:'nearest'});
+}
+function vcClear(){
+  ['vcGtCv','vcPdCv'].forEach(id=>{ const cv=document.getElementById(id);
+    const x=cv.getContext('2d'); x.clearRect(0,0,cv.width,cv.height); });
+  document.getElementById('vcPos').textContent='0 / 0';
+  document.getElementById('vcGtN').textContent=''; document.getElementById('vcPdN').innerHTML='';
+}
+function vcGo(d){ if(vcImgs.length) vcShow(vcIdx+d); }
+function vcShow(i){
+  if(!vcImgs.length){ vcStrip(); vcClear(); return; }
+  vcIdx=Math.max(0, Math.min(vcImgs.length-1, i));
+  const r=vcImgs[vcIdx];
+  document.getElementById('vcPos').textContent=(vcIdx+1)+' / '+vcImgs.length;
+  document.getElementById('vcGtN').textContent=r.gt.length+' box'+(r.gt.length===1?'':'es');
+  document.getElementById('vcPdN').innerHTML=vcBadges(r.tp,r.fp,r.fn) || '<span class="cbadge">nothing predicted</span>';
+  vcStrip();
+  const im=new Image();
+  im.onload=()=>{
+    vcPaint('vcGtCv', im, r.gt.map(b=>({b, k:'gt'})));
+    vcPaint('vcPdCv', im, r.pd.map(b=>({b, k:b[6]?'tp':'fp'}))
+                            .concat(r.gt.filter(b=>!b[5]).map(b=>({b, k:'fn'}))));
+  };
+  im.src='/api/val/image?p='+encodeURIComponent(r.p);
+}
+function vcPaint(id, im, items){
+  const cv=document.getElementById(id), wrap=cv.parentElement;
+  const mw=Math.max(40, wrap.clientWidth-4), mh=Math.max(40, wrap.clientHeight-4);
+  const s=Math.min(mw/im.naturalWidth, mh/im.naturalHeight);
+  cv.width=Math.round(im.naturalWidth*s); cv.height=Math.round(im.naturalHeight*s);
+  const ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.drawImage(im,0,0,cv.width,cv.height);
+  items.forEach(({b,k})=>{
+    const w=b[3]*cv.width, h=b[4]*cv.height;
+    const x=b[1]*cv.width-w/2, y=b[2]*cv.height-h/2;
+    const col=VC_COL[k];
+    ctx.setLineDash(k==='fn'?[7,5]:[]);
+    ctx.lineWidth=2.5; ctx.strokeStyle=col;
+    ctx.fillStyle=hexToRgba(col,0.14); ctx.fillRect(x,y,w,h);
+    ctx.strokeRect(x,y,w,h);
+    ctx.setLineDash([]);
+    const lab = k==='gt' ? 'GT' : k==='fn' ? 'MISSED'
+              : (k==='tp'?'TP ':'FP ')+Number(b[5]).toFixed(2);
+    ctx.font='bold 11px system-ui,Arial';
+    const tw=ctx.measureText(lab).width+8, ty=Math.max(0,y-15);
+    ctx.fillStyle=col; ctx.fillRect(x,ty,tw,15);
+    ctx.fillStyle='#fff'; ctx.fillText(lab, x+4, ty+11);
+  });
 }
 function valShowCfg(){ _valCard('cfg'); valMsg(''); }
 function valShowMap(){ _valCard('map'); }
@@ -4667,6 +4918,7 @@ async function valOpenRun(id){
     const h=await fetch('/api/val/history/'+encodeURIComponent(id)+'?t='+Date.now()).then(r=>r.json());
     if(h.error){ return; }
     if(h.config) valLastConfig=h.config;
+    valCurRunId=h.id;
     renderValResult(h.result, h.finished_at);
   }catch(e){}
 }
@@ -4834,6 +5086,7 @@ function pollValidation(){
       clearInterval(valPoll);
       if(s.error) return;                       // leave the error shown
       if(s.config) valLastConfig=s.config;
+      if(s.run_id) valCurRunId=s.run_id;
       if(s.result){ renderValResult(s.result, s.finished_at); valHistCount(); }
     }
   }, 1000);
@@ -4911,6 +5164,7 @@ function valInsights(res){
   return {verdict, vclass, good:good.slice(0,5), bad:bad.slice(0,6), notes};
 }
 function renderValResult(res, finishedAt){
+  valCurResult=res;
   const o=res.overall||{};
   let h='<div class="val-tiles">'
     +'<div class="val-tile hero"><div class="vt-k">mAP@50</div><div class="vt-v">'+(o.map50||0).toFixed(3)+'</div></div>'
@@ -4948,9 +5202,11 @@ function renderValResult(res, finishedAt){
   h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th><th>TP</th><th>FP</th><th>FN</th>'
     +'<th>Precision</th><th>Recall</th><th>F1</th><th title="TP / (TP + FP + FN)">Accuracy</th>'
     +'<th>AP@50</th></tr></thead><tbody>';
-  (res.per_class||[]).forEach(c=>{
+  (res.per_class||[]).forEach((c,ci)=>{
     const dim = c.gt ? '' : ' class="dim"';
-    h+='<tr><td>'+escapeHtml(c.name)+'</td><td'+dim+'>'+c.gt+'</td><td>'+c.tp+'</td><td>'+c.fp+'</td><td>'+c.fn+'</td>'
+    const nm = '<button class="clslink" title="see the images for this class" onclick="valOpenClass('+ci+')">'
+      +escapeHtml(c.name)+'</button>';
+    h+='<tr><td>'+nm+'</td><td'+dim+'>'+c.gt+'</td><td>'+c.tp+'</td><td>'+c.fp+'</td><td>'+c.fn+'</td>'
       +'<td>'+pct(c.precision)+'</td><td>'+pct(c.recall)+'</td><td>'+pct(c.f1)+'</td>'
       +'<td>'+pct(accOf(c))+'</td><td>'+c.ap50.toFixed(3)+'</td></tr>';
   });
