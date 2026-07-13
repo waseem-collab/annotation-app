@@ -1772,6 +1772,24 @@ def _iou(a, b):
     return inter / union if union > 0 else 0.0
 
 
+def _contained(a, b, frac=0.95):
+    """True when one box lies (essentially) entirely inside the other.
+    Uses intersection over the SMALLER box, so a tiny box inside a big one — which
+    would score a poor IoU — still counts as finding the object. `frac` gives a
+    little slack for a pixel of overhang."""
+    ax1, ay1 = a["cx"] - a["w"] / 2, a["cy"] - a["h"] / 2
+    ax2, ay2 = a["cx"] + a["w"] / 2, a["cy"] + a["h"] / 2
+    bx1, by1 = b["cx"] - b["w"] / 2, b["cy"] - b["h"] / 2
+    bx2, by2 = b["cx"] + b["w"] / 2, b["cy"] + b["h"] / 2
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    if inter <= 0:
+        return False
+    smaller = min(a["w"] * a["h"], b["w"] * b["h"])
+    return smaller > 0 and (inter / smaller) >= frac
+
+
 def _average_precision(dets, n_gt):
     """AP from detections [(conf, is_tp)] using all-point interpolation."""
     if n_gt == 0 or not dets:
@@ -1871,7 +1889,8 @@ def _set_val(**kw):
         _val_job.update(kw)
 
 
-def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mapping, config=None):
+def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mapping,
+                 contain=True, config=None):
     """Run the model over the project's ground truth and score it. Read-only."""
     try:
         n_cls = len(classes)
@@ -1930,14 +1949,17 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                                key=lambda x: -x["conf"])
                     used = [False] * len(g)
                     for pr in p:
-                        best, best_j = 0.0, -1
+                        # a GT qualifies on IoU, or (optionally) if one box fully
+                        # contains the other; among qualifiers take the best IoU
+                        best, best_j = -1.0, -1
                         for j, gb in enumerate(g):
                             if used[j]:
                                 continue
                             v = _iou(pr, gb)
-                            if v > best:
+                            ok = v >= iou_thr or (contain and _contained(pr, gb))
+                            if ok and v > best:
                                 best, best_j = v, j
-                        is_tp = best >= iou_thr and best_j >= 0
+                        is_tp = best_j >= 0
                         pr["tp"] = bool(is_tp)
                         if is_tp:
                             used[best_j] = True
@@ -1992,7 +2014,7 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                               "precision": P, "recall": R, "f1": F1, "accuracy": ACC,
                               "map50": (sum_ap / n_present) if n_present else 0.0},
                   "images": n_images, "tasks": len(task_ids),
-                  "conf": conf, "iou": iou_thr,
+                  "conf": conf, "iou": iou_thr, "contain": bool(contain),
                   "model": os.path.basename(model_path), "project_id": project_id}
         import time
         finished_at = time.strftime("%Y-%m-%d %H:%M")
@@ -2081,10 +2103,11 @@ def api_val_run():
     mapping = _parse_mapping(data.get("mapping"))
     if not mapping:
         return jsonify({"error": "map at least one model class"}), 400
+    contain = bool(data.get("contain", True))     # containment counts as a match
     # everything needed to reproduce/pre-fill this run next time
     config = {"model": data.get("model"), "model_name": os.path.basename(model_path),
               "project_id": project_id, "task_ids": task_ids, "classes": list(classes),
-              "conf": conf, "iou": iou_thr,
+              "conf": conf, "iou": iou_thr, "contain": contain,
               "mapping": {str(k): v for k, v in mapping.items()}}
     with _val_lock:
         if _val_job["running"]:
@@ -2094,7 +2117,7 @@ def api_val_run():
                         error=None, config=config, finished_at=None)
     threading.Thread(target=_do_validate,
                      args=(model_path, project_id, task_ids, list(classes), conf, iou_thr,
-                           mapping, config),
+                           mapping, contain, config),
                      daemon=True).start()
     return jsonify({"started": True, "tasks": len(task_ids)})
 
@@ -2457,6 +2480,11 @@ HTML = r"""<!DOCTYPE html>
     cursor:pointer;transition:background .12s,color .12s,border-color .12s;}
   .histdel:hover{background:var(--danger-soft);color:var(--danger);border-color:var(--danger-border);}
   .val-two{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .modal-body label.valtick{display:flex;align-items:flex-start;gap:8px;margin-top:12px;font-size:12.5px;
+    color:var(--text);line-height:1.5;cursor:pointer;
+    text-transform:none;letter-spacing:normal;font-weight:500;}
+  .valtick input{margin:2px 0 0;accent-color:var(--accent);flex:none;width:15px;height:15px;}
+  .valhint{color:var(--text-muted);font-weight:400;}
   .val-result{flex:1;overflow:auto;padding:22px 24px;}
   .val-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px;}
   .val-tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);
@@ -3109,6 +3137,11 @@ HTML = r"""<!DOCTYPE html>
           <div><label>Confidence</label><input id="valconf" type="number" min="0" max="1" step="0.05" value="0.4"></div>
           <div><label>IoU match</label><input id="valiou" type="number" min="0.05" max="0.95" step="0.05" value="0.5"></div>
         </div>
+        <label class="tick valtick"><input type="checkbox" id="valcontain" checked>
+          <span>Count a box fully inside the other as a match
+            <span class="valhint">&mdash; if the prediction contains the ground truth (or vice&#8209;versa), it counts as a TP even when the IoU is low.</span>
+          </span>
+        </label>
         <div id="valmsg" class="aamsg"></div>
       </div>
       <div class="modal-f">
@@ -4755,6 +4788,7 @@ async function valPrefill(cfg){
     valModelChip(cfg.model_name, 'last used');
     if(cfg.conf!=null) document.getElementById('valconf').value=cfg.conf;
     if(cfg.iou!=null) document.getElementById('valiou').value=cfg.iou;
+    if(cfg.contain!=null) document.getElementById('valcontain').checked=!!cfg.contain;
     const sel=document.getElementById('valproj');
     sel.value=String(cfg.project_id); syncDD(sel);
     if(!sel.value) return;                       // project no longer in the list
@@ -5065,7 +5099,8 @@ async function runValidation(){
   const body={ model:valModel.path, project_id:document.getElementById('valproj').value,
     task_ids:valCheckedTasks(), classes:valGtClasses, mapping,
     conf:parseFloat(document.getElementById('valconf').value)||0.4,
-    iou:parseFloat(document.getElementById('valiou').value)||0.5 };
+    iou:parseFloat(document.getElementById('valiou').value)||0.5,
+    contain:document.getElementById('valcontain').checked };
   valMsg('','valmsg2'); valShowProg();
   document.getElementById('valprogtext').textContent='starting…';
   try{
@@ -5178,6 +5213,7 @@ function renderValResult(res, finishedAt){
     +'</div>';
   h+='<div class="val-sub">'+escapeHtml(res.model||'')+' &nbsp;·&nbsp; project '+escapeHtml(String(res.project_id||''))
     +' &nbsp;·&nbsp; '+(res.tasks||0)+' task(s) &nbsp;·&nbsp; conf &ge; '+res.conf+' &nbsp;·&nbsp; IoU &ge; '+res.iou
+    +(res.contain ? ' <b>or contained</b>' : '')
     +(finishedAt?(' &nbsp;·&nbsp; <b>last run '+escapeHtml(finishedAt)+'</b>'):'')
     +' &nbsp;·&nbsp; ground truth was only read, never modified</div>';
 
