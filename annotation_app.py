@@ -2859,6 +2859,9 @@ HTML = r"""<!DOCTYPE html>
     color:var(--text-muted);margin-bottom:4px;}
   .agree .ag-v{font-size:18px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;}
   table.valtab td.wa{color:#6366f1;font-weight:700;} table.valtab td.wb{color:#db2777;font-weight:700;}
+  .wbasis{font-size:9px;font-weight:600;opacity:.65;text-transform:none;letter-spacing:0;margin-left:3px;}
+  .splitmark{display:inline-block;margin-left:6px;font-size:13px;color:var(--warn);cursor:help;font-weight:700;}
+  table.valtab tr.splitrow td{background:rgba(251,191,36,.07);}
   .dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;
     padding:22px 14px;border:2px dashed var(--border-2);border-radius:var(--r-lg);background:var(--bg);
     color:var(--text-muted);cursor:pointer;text-align:center;
@@ -6122,29 +6125,54 @@ function renderCmpResult(res, finishedAt){
       +(ag.neither||0)+' objects ('+p(ag.neither||0)+') are missed by <b>both</b> — no amount of picking between these two models will catch them.'
     +'</li></ul></div>';
   // per-class head to head
+  const splits=[];
   h+='<table class="valtab"><thead><tr><th>Class</th><th>GT</th>'
     +'<th>A · AP</th><th>B · AP</th><th>Δ AP</th>'
-    +'<th>A · P</th><th>B · P</th><th>A · R</th><th>B · R</th><th>Winner</th></tr></thead><tbody>';
+    +'<th title="F1 at your confidence threshold">A · F1</th><th title="F1 at your confidence threshold">B · F1</th>'
+    +'<th>A · P</th><th>B · P</th><th>A · R</th><th>B · R</th>'
+    +'<th title="Decided by AP@50 — how well a model ranks detections across every confidence level, not just yours">'
+    +'Winner <span class="wbasis">by AP</span></th></tr></thead><tbody>';
   (a.per_class||[]).forEach((ca,ci)=>{
     const cb=(b.per_class||[])[ci]||{}; const d=(cb.ap50||0)-(ca.ap50||0);
-    const w = !ca.gt ? '' : (Math.abs(d)<0.01 ? '<span class="cbadge">tie</span>'
-      : (d>0 ? '<span class="ab b">B</span>' : '<span class="ab a">A</span>'));
+    const df=(cb.f1||0)-(ca.f1||0);
+    const apW = Math.abs(d)<0.01 ? '' : (d>0?'b':'a');
+    const f1W = Math.abs(df)<0.01 ? '' : (df>0?'b':'a');
+    const split = ca.gt && apW && f1W && apW!==f1W;
+    if(split) splits.push(ca.name);
+    let w = !ca.gt ? '' : (!apW ? '<span class="cbadge">tie</span>'
+      : '<span class="ab '+apW+'">'+apW.toUpperCase()+'</span>');
+    if(split) w+='<span class="splitmark" title="Split decision — '+apW.toUpperCase()
+      +' ranks better across all thresholds (AP@50), but '+f1W.toUpperCase()
+      +' is better at your confidence of '+res.conf+' (F1). Trust F1 if you deploy at a fixed '
+      +'confidence; trust AP if you may tune it.">&#8646;</span>';
     const dim = ca.gt ? '' : ' class="dim"';
-    h+='<tr><td><button class="clslink" onclick="cmpOpenClass('+ci+')">'+escapeHtml(ca.name)+'</button></td>'
+    h+='<tr'+(split?' class="splitrow"':'')+'>'
+      +'<td><button class="clslink" onclick="cmpOpenClass('+ci+')">'+escapeHtml(ca.name)+'</button></td>'
       +'<td'+dim+'>'+ca.gt+'</td>'
       +'<td'+(d<0?' class="wa"':'')+'>'+(ca.ap50||0).toFixed(3)+'</td>'
       +'<td'+(d>0?' class="wb"':'')+'>'+(cb.ap50||0).toFixed(3)+'</td>'
       +'<td>'+(ca.gt?dlt(d):'—')+'</td>'
+      +'<td'+(df<0?' class="wa"':'')+'>'+pct(ca.f1||0)+'</td>'
+      +'<td'+(df>0?' class="wb"':'')+'>'+pct(cb.f1||0)+'</td>'
       +'<td>'+pct(ca.precision||0)+'</td><td>'+pct(cb.precision||0)+'</td>'
       +'<td>'+pct(ca.recall||0)+'</td><td>'+pct(cb.recall||0)+'</td>'
       +'<td>'+w+'</td></tr>';
   });
   h+='<tr class="total"><td>ALL</td><td>'+(oa.gt||0)+'</td>'
     +'<td>'+oa.map50.toFixed(3)+'</td><td>'+ob.map50.toFixed(3)+'</td><td>'+dlt(dmap)+'</td>'
+    +'<td>'+pct(oa.f1)+'</td><td>'+pct(ob.f1)+'</td>'
     +'<td>'+pct(oa.precision)+'</td><td>'+pct(ob.precision)+'</td>'
     +'<td>'+pct(oa.recall)+'</td><td>'+pct(ob.recall)+'</td>'
     +'<td>'+(win==='tie'?'—':'<span class="ab '+win+'">'+win.toUpperCase()+'</span>')+'</td></tr>';
   h+='</tbody></table>';
+  if(splits.length)
+    h+='<div class="ins-notes" style="margin-top:14px;"><ul><li>'
+      +'<b>&#8646; Split decision on '+splits.map(escapeHtml).join(', ')+'.</b> '
+      +'The Winner column is decided by <b>AP@50</b> — how well a model ranks its detections across '
+      +'<i>every</i> confidence level. On these classes the other model is better at <b>your</b> '
+      +'confidence of '+res.conf+' (higher F1, more TPs), but ranks worse overall. '
+      +'If you will deploy at a fixed confidence, go by <b>F1</b>; if you may tune the threshold later, '
+      +'go by <b>AP</b>.</li></ul></div>';
   document.getElementById('cmpresult').innerHTML=h;
   cmpShowResult();
 }
