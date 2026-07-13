@@ -1826,18 +1826,37 @@ VAL_HIST_MAX = 30
 
 
 def _load_val_history():
+    if not os.path.exists(VAL_HIST_FILE):
+        return []
     try:
         with open(VAL_HIST_FILE, encoding="utf-8") as fh:
             d = json.load(fh)
-        return d if isinstance(d, list) else []
-    except (OSError, ValueError):
+        if isinstance(d, list):
+            return d
+        raise ValueError("history is not a list")
+    except (OSError, ValueError) as e:
+        # NEVER silently drop the file: a later save would overwrite it with a
+        # single run and destroy every past result. Keep the bad copy aside.
+        try:
+            bad = VAL_HIST_FILE + ".corrupt"
+            if not os.path.exists(bad):
+                os.replace(VAL_HIST_FILE, bad)
+                print(f"[val] history unreadable ({e}); kept a copy at {bad}")
+        except OSError:
+            pass
         return []
 
 
 def _save_val_history(hist):
+    """Atomic write — a crash mid-save can never leave a half-written history."""
     try:
-        with open(VAL_HIST_FILE, "w", encoding="utf-8") as fh:
+        os.makedirs(os.path.dirname(VAL_HIST_FILE) or ".", exist_ok=True)
+        tmp = VAL_HIST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(hist[:VAL_HIST_MAX], fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, VAL_HIST_FILE)
     except OSError:
         pass
 
@@ -1865,13 +1884,17 @@ def _append_val_history(run_id, config, result, finished_at):
 def _restore_last_val():
     """Seed the job with the newest run so the page shows it after a restart."""
     hist = _load_val_history()
-    if not hist:                                   # migrate the old single-run file
+    # Migrate the legacy single-run file ONLY when there is genuinely no history
+    # file at all. Migrating just because a read came back empty would overwrite a
+    # real history with one run — never let a failed read cause a destructive write.
+    if not hist and not os.path.exists(VAL_HIST_FILE) and os.path.exists(VAL_LAST_FILE):
         try:
             with open(VAL_LAST_FILE, encoding="utf-8") as fh:
                 d = json.load(fh)
             if d.get("result"):
                 _append_val_history(str(d.get("finished_at") or "legacy"),
                                     d.get("config"), d["result"], d.get("finished_at"))
+                os.replace(VAL_LAST_FILE, VAL_LAST_FILE + ".migrated")   # cannot fire twice
                 hist = _load_val_history()
         except (OSError, ValueError):
             pass
@@ -2016,6 +2039,7 @@ def _do_validate(model_path, project_id, task_ids, classes, conf, iou_thr, mappi
                   "images": n_images, "tasks": len(task_ids),
                   "conf": conf, "iou": iou_thr, "contain": bool(contain),
                   "model": (config or {}).get("model_name") or os.path.basename(model_path),
+                  "name": (config or {}).get("name") or "",
                   "model_file": os.path.basename(model_path), "project_id": project_id}
         import time
         finished_at = time.strftime("%Y-%m-%d %H:%M")
@@ -2112,7 +2136,8 @@ def api_val_run():
     contain = bool(data.get("contain", True))     # containment counts as a match
     # the name the user dropped (display) vs the unique file we stored it as
     display = (data.get("model_name") or "").strip() or os.path.basename(model_path)
-    config = {"model": data.get("model"), "model_name": display,
+    run_name = (data.get("name") or "").strip()[:80]
+    config = {"model": data.get("model"), "model_name": display, "name": run_name,
               "model_file": os.path.basename(model_path),
               "project_id": project_id, "task_ids": task_ids, "classes": list(classes),
               "conf": conf, "iou": iou_thr, "contain": contain,
@@ -2149,6 +2174,7 @@ def api_val_history():
         if acc is None:                       # older runs: derive it
             acc = tp / (tp + fp + fn) if (tp + fp + fn) else 0.0
         out.append({"id": h.get("id"), "finished_at": h.get("finished_at"),
+                    "name": r.get("name") or c.get("name") or "",
                     "model": r.get("model") or c.get("model_name"),
                     "model_file": r.get("model_file") or c.get("model_file") or "",
                     "project_id": r.get("project_id"), "tasks": r.get("tasks"),
@@ -2502,6 +2528,10 @@ HTML = r"""<!DOCTYPE html>
     cursor:pointer;transition:background .12s,color .12s,border-color .12s;}
   .histdel:hover{background:var(--danger-soft);color:var(--danger);border-color:var(--danger-border);}
   .val-two{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .valopt{font-size:10px;font-weight:500;color:var(--text-dim);text-transform:none;letter-spacing:0;
+    border:1px solid var(--border);border-radius:999px;padding:1px 6px;margin-left:5px;}
+  .val-name{font-size:19px;font-weight:700;color:var(--text);letter-spacing:-.2px;margin-bottom:4px;}
+  table.valtab td.runname{font-weight:600;color:var(--accent);}
   .modal-body label.valtick{display:flex;align-items:flex-start;gap:8px;margin-top:12px;font-size:12.5px;
     color:var(--text);line-height:1.5;cursor:pointer;
     text-transform:none;letter-spacing:normal;font-weight:500;}
@@ -3135,6 +3165,9 @@ HTML = r"""<!DOCTYPE html>
   <div class="val-page">
     <div id="valcfg" class="modal" style="width:470px;">
       <div class="modal-body">
+        <label>Run name <span class="valopt">optional</span></label>
+        <input id="valname" type="text" placeholder="e.g. best-v3 · egypt tasks" maxlength="80"
+               onkeydown="if(event.key==='Enter')valNext()">
         <label>Model</label>
         <div id="valdrop" class="dropzone" onclick="document.getElementById('valfile').click()">
           <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5-5 5 5"/><path d="M12 5v12"/></svg>
@@ -4824,10 +4857,11 @@ async function enterVal(){
 // restore the previous run's model / project / tasks / thresholds into the form
 async function valPrefill(cfg){
   try{
-    // NOTE: the model is deliberately NOT restored — you drop a fresh .pt each run,
-    // so a run can never be silently attributed to the previous model.
+    // NOTE: the model and run name are deliberately NOT restored — you drop a fresh
+    // .pt each run, so a run can never be silently attributed to the previous model.
     valClearModel();
-    if(cfg.conf!=null) document.getElementById('valconf').value=cfg.conf;
+    document.getElementById('valname').value='';
+    document.getElementById('valconf').value=0.4;      // conf always starts at the default
     if(cfg.iou!=null) document.getElementById('valiou').value=cfg.iou;
     if(cfg.contain!=null) document.getElementById('valcontain').checked=!!cfg.contain;
     const sel=document.getElementById('valproj');
@@ -4969,12 +5003,13 @@ async function valShowHistory(){
   const runs=await valHistCount();
   if(!runs.length){ host.innerHTML='<div class="browse-empty">No past runs yet — validate a model and it will show up here.</div>'; return; }
   let h='<div class="val-sub">'+runs.length+' past run(s) — newest first. Click one to view its full report.</div>';
-  h+='<table class="valtab"><thead><tr><th>When</th><th>Model</th><th>Project</th><th>Tasks</th>'
+  h+='<table class="valtab"><thead><tr><th>When</th><th>Run</th><th>Model</th><th>Project</th><th>Tasks</th>'
     +'<th>Images</th><th>conf / IoU</th><th>mAP@50</th><th>Precision</th><th>Recall</th><th>F1</th>'
     +'<th title="TP / (TP + FP + FN)">Accuracy</th><th></th></tr></thead><tbody>';
   runs.forEach(r=>{
     h+='<tr class="histrow" onclick="valOpenRun(\''+r.id+'\')">'
       +'<td>'+escapeHtml(r.finished_at||'')+'</td>'
+      +(r.name ? '<td class="runname">'+escapeHtml(r.name)+'</td>' : '<td class="dim">—</td>')
       +'<td title="'+escapeHtml(r.model_file||r.model||'')+'">'+escapeHtml(r.model||'')+'</td>'
       +'<td>'+escapeHtml(String(r.project_id||''))+'</td>'
       +'<td>'+(r.tasks||0)+'</td><td>'+(r.images||0)+'</td>'
@@ -5138,6 +5173,7 @@ async function runValidation(){
   });
   if(!Object.keys(mapping).length){ valMsg('map at least one class','valmsg2'); return; }
   const body={ model:valModel.path, model_name:valModel.name,
+    name:document.getElementById('valname').value.trim(),
     project_id:document.getElementById('valproj').value,
     task_ids:valCheckedTasks(), classes:valGtClasses, mapping,
     conf:parseFloat(document.getElementById('valconf').value)||0.4,
@@ -5253,6 +5289,7 @@ function renderValResult(res, finishedAt){
     +'<div class="val-tile"><div class="vt-k">TP / FP / FN</div><div class="vt-v" style="font-size:16px;">'
       +(o.tp||0)+' / '+(o.fp||0)+' / '+(o.fn||0)+'</div></div>'
     +'</div>';
+  if(res.name) h+='<div class="val-name">'+escapeHtml(res.name)+'</div>';
   h+='<div class="val-sub">'+escapeHtml(res.model||'')+' &nbsp;·&nbsp; project '+escapeHtml(String(res.project_id||''))
     +' &nbsp;·&nbsp; '+(res.tasks||0)+' task(s) &nbsp;·&nbsp; conf &ge; '+res.conf+' &nbsp;·&nbsp; IoU &ge; '+res.iou
     +(res.contain ? ' <b>or contained</b>' : '')
