@@ -3206,14 +3206,15 @@ HTML = r"""<!DOCTYPE html>
   #galview .browse-bar button:disabled{opacity:.4;cursor:default;}
   .gal-count{font-size:12.5px;color:var(--text-muted);}
   .gal-selinfo{font-size:12.5px;font-weight:600;color:var(--accent);margin-right:4px;}
-  .gal-grid{flex:1;overflow:auto;display:grid;align-content:start;gap:12px;padding:16px 18px;
-    grid-template-columns:repeat(auto-fill,minmax(220px,1fr));}
-  .gtile{position:relative;border:1px solid var(--border);border-radius:var(--r);overflow:hidden;
-    cursor:pointer;background:var(--canvas-bg);aspect-ratio:4/3;
-    transition:border-color .12s,box-shadow .12s,transform .1s;}
+  .gal-grid{flex:1;min-height:0;overflow:auto;display:grid;align-content:start;gap:12px;padding:16px 18px;
+    grid-template-columns:repeat(auto-fill,minmax(210px,1fr));grid-auto-rows:190px;}
+  .gtile{position:relative;height:190px;border:1px solid var(--border);border-radius:var(--r);
+    overflow:hidden;cursor:pointer;background:var(--canvas-bg);
+    transition:border-color .12s,box-shadow .12s;}
   .gtile:hover{border-color:var(--border-2);box-shadow:var(--sh-md);}
-  /* contain, not cover: show the WHOLE image (letterboxed) instead of cropping it */
-  .gtile img{width:100%;height:100%;object-fit:contain;display:block;}
+  /* contain, not cover: show the WHOLE image (letterboxed) instead of cropping it.
+     absolute + explicit tile height => tiles can never collapse/overlap. */
+  .gtile img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;}
   .gtile.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent);}
   .gtile .gt-check{position:absolute;top:7px;left:7px;width:22px;height:22px;border-radius:50%;
     background:rgba(0,0,0,.45);border:2px solid #fff;display:flex;align-items:center;justify-content:center;
