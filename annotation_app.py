@@ -353,6 +353,50 @@ def api_delete(idx):
     return jsonify({"ok": True, "deleted": name, "count": len(IMAGES)})
 
 
+@app.route("/api/gallery")
+def api_gallery():
+    """All image names in the current folder, with a box count each (for badges)."""
+    out = []
+    for n in IMAGES:
+        boxes = read_label(n)
+        out.append({"name": n, "boxes": len(boxes)})
+    return jsonify({"images": out, "count": len(IMAGES), "path": DATA})
+
+
+@app.route("/api/image_by_name")
+def api_image_by_name():
+    """Serve an image by its basename (used by the gallery grid)."""
+    name = request.args.get("name", "")
+    if name not in IMAGES:            # membership check = no path traversal
+        return Response("not found", status=404)
+    return send_file(os.path.join(IMG_DIR, name))
+
+
+@app.route("/api/delete_many", methods=["POST"])
+def api_delete_many():
+    """Delete several images (+ their labels) by NAME, so it's immune to the index
+    shifting as files are removed."""
+    global IMAGES
+    names = (request.get_json(force=True, silent=True) or {}).get("names") or []
+    deleted, errors = [], []
+    for name in names:
+        if name not in IMAGES:
+            continue
+        try:
+            ip = os.path.join(IMG_DIR, name)
+            if os.path.exists(ip):
+                os.remove(ip)
+            lp = label_path_for(name)
+            if os.path.exists(lp):
+                os.remove(lp)
+            deleted.append(name)
+        except OSError as e:
+            errors.append(f"{name}: {e}")
+    IMAGES = list_images()
+    return jsonify({"ok": True, "deleted": len(deleted), "names": deleted,
+                    "count": len(IMAGES), "errors": errors})
+
+
 # --------------------------------------------------------------------------- #
 # CVAT upload
 # --------------------------------------------------------------------------- #
@@ -3155,6 +3199,33 @@ HTML = r"""<!DOCTYPE html>
   .browse-grid{flex:1;overflow:auto;display:grid;align-content:start;gap:14px;padding:20px;
                grid-template-columns:repeat(auto-fill,minmax(240px,1fr));}
   .browse-empty{color:var(--text-dim);padding:20px;font-size:14px;}
+  /* ---- gallery ---- */
+  #galview .browse-bar button.danger{background:var(--danger-soft);color:var(--danger);
+    border-color:var(--danger-border);}
+  #galview .browse-bar button.danger:hover:not(:disabled){background:var(--danger);color:#fff;border-color:var(--danger);}
+  #galview .browse-bar button:disabled{opacity:.4;cursor:default;}
+  .gal-count{font-size:12.5px;color:var(--text-muted);}
+  .gal-selinfo{font-size:12.5px;font-weight:600;color:var(--accent);margin-right:4px;}
+  .gal-grid{flex:1;overflow:auto;display:grid;align-content:start;gap:12px;padding:16px 18px;
+    grid-template-columns:repeat(auto-fill,minmax(150px,1fr));}
+  .gtile{position:relative;border:1px solid var(--border);border-radius:var(--r);overflow:hidden;
+    cursor:pointer;background:var(--surface);aspect-ratio:1/1;
+    transition:border-color .12s,box-shadow .12s,transform .1s;}
+  .gtile:hover{border-color:var(--border-2);box-shadow:var(--sh-md);}
+  .gtile img{width:100%;height:100%;object-fit:cover;display:block;background:var(--canvas-bg);}
+  .gtile.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent);}
+  .gtile .gt-check{position:absolute;top:7px;left:7px;width:22px;height:22px;border-radius:50%;
+    background:rgba(0,0,0,.45);border:2px solid #fff;display:flex;align-items:center;justify-content:center;
+    color:#fff;opacity:0;transition:opacity .12s;pointer-events:none;}
+  .gtile:hover .gt-check{opacity:.7;}
+  .gtile.sel .gt-check{opacity:1;background:var(--accent);border-color:var(--accent);}
+  .gtile .gt-bar{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;
+    justify-content:space-between;gap:6px;padding:4px 8px;font-size:10.5px;color:#fff;
+    background:linear-gradient(transparent,rgba(0,0,0,.72));pointer-events:none;}
+  .gtile .gt-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .gtile .gt-boxes{flex:none;font-weight:700;}
+  .gtile .gt-boxes.zero{color:#fca5a5;}
+  .gtile.sel::after{content:"";position:absolute;inset:0;background:rgba(110,168,254,.20);pointer-events:none;}
   .bcard{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px;
          cursor:pointer;box-shadow:var(--sh-sm);display:flex;flex-direction:column;gap:6px;
          transition:transform .12s,border-color .12s,box-shadow .12s;}
@@ -3267,6 +3338,7 @@ HTML = r"""<!DOCTYPE html>
       <input id="folder" type="text" placeholder="folder with images/ + labels/ + labels.txt"
              onkeydown="if(event.key==='Enter')loadFolder()">
       <button class="wide" onclick="loadFolder()">Load folder</button>
+      <button class="wide" onclick="openGallery()"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px;vertical-align:-3px;"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>Gallery</button>
     </div>
     <div class="lp-sec">
       <h4>Active class &mdash; hold <kbd>C</kbd> for wheel</h4>
@@ -3523,6 +3595,20 @@ HTML = r"""<!DOCTYPE html>
     </div>
     </div>
   </div>
+</div>
+
+<div id="galview" class="browse">
+  <div class="browse-bar">
+    <button onclick="closeGallery()" title="back to editor"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Editor</button>
+    <span class="browse-title">Gallery</span>
+    <span id="galcount" class="gal-count"></span>
+    <span class="spacer"></span>
+    <span id="galselinfo" class="gal-selinfo"></span>
+    <button id="galselall" onclick="galSelectAll()">Select all</button>
+    <button id="galclear" onclick="galClearSel()" style="display:none;">Clear</button>
+    <button id="galdel" class="danger" onclick="galDeleteSelected()" disabled><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>Delete</button>
+  </div>
+  <div id="galgrid" class="gal-grid"></div>
 </div>
 
 <div id="valview" class="browse">
@@ -4218,7 +4304,7 @@ function updateModeBadge(){
 }
 // only one full-screen surface at a time
 function hideAllScreens(){
-  ['home','cvatbrowse','ccview','apmodal','valview','cmpview'].forEach(id=>{
+  ['home','cvatbrowse','ccview','apmodal','valview','cmpview','galview'].forEach(id=>{
     const e=document.getElementById(id); if(e) e.style.display='none'; });
 }
 function enterLocal(){
@@ -4272,6 +4358,96 @@ function saveSession(){
 async function persistClasses(){
   try{ await fetch('/api/classes',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({classes})}); }catch(e){}
+}
+
+// ---- gallery: grid of all images, multi-select, batch delete ----
+let galImgs=[], galSel=new Set();
+async function openGallery(){
+  const path=document.getElementById('folder').value.trim();
+  if(!count && !path){ setStatus('load a folder first'); return; }
+  hideAllScreens();
+  document.getElementById('galview').style.display='flex';
+  const grid=document.getElementById('galgrid');
+  grid.innerHTML='<div class="browse-empty">loading images…</div>';
+  galSel.clear();
+  try{
+    const r=await fetch('/api/gallery?t='+Date.now()).then(r=>r.json());
+    galImgs=r.images||[];
+    renderGallery();
+  }catch(e){ grid.innerHTML='<div class="browse-empty">failed to load images</div>'; }
+}
+function closeGallery(){
+  document.getElementById('galview').style.display='none';
+  if(img && img.complete){ fit(); draw(); }        // back to the editor
+}
+function renderGallery(){
+  const grid=document.getElementById('galgrid');
+  document.getElementById('galcount').textContent=galImgs.length+' image'+(galImgs.length===1?'':'s');
+  if(!galImgs.length){ grid.innerHTML='<div class="browse-empty">no images in this folder</div>'; galUpdateBar(); return; }
+  const check='<span class="gt-check"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>';
+  grid.innerHTML=galImgs.map((im,i)=>{
+    const sel=galSel.has(im.name)?' sel':'';
+    return '<div class="gtile'+sel+'" data-i="'+i+'" onclick="galToggle('+i+',event)" ondblclick="galOpen('+i+')" title="'+escapeHtml(im.name)+' — double-click to open">'
+      +'<img loading="lazy" src="/api/image_by_name?name='+encodeURIComponent(im.name)+'">'
+      +check
+      +'<div class="gt-bar"><span class="gt-name">'+escapeHtml(im.name)+'</span>'
+      +'<span class="gt-boxes'+(im.boxes?'':' zero')+'">'+im.boxes+'</span></div></div>';
+  }).join('');
+  galUpdateBar();
+}
+let _galLast=-1;
+function _galPaint(i){
+  const t=document.querySelector('.gtile[data-i="'+i+'"]');
+  if(t) t.classList.toggle('sel', galSel.has(galImgs[i].name));
+}
+function galToggle(i,e){                        // click = toggle, shift-click = range
+  const name=galImgs[i].name;
+  if(e && e.shiftKey && _galLast>=0){
+    const [a,b]=[Math.min(_galLast,i),Math.max(_galLast,i)];
+    for(let k=a;k<=b;k++){ galSel.add(galImgs[k].name); _galPaint(k); }
+  } else {
+    if(galSel.has(name)) galSel.delete(name); else galSel.add(name);
+    _galPaint(i);
+  }
+  _galLast=i;
+  galUpdateBar();
+}
+function galOpen(i){                            // double-click -> edit that image
+  const idx0=IMAGES_indexOf(galImgs[i].name);
+  closeGallery();
+  if(idx0>=0) load(idx0);
+}
+function IMAGES_indexOf(name){                  // gallery order == server IMAGES order
+  for(let i=0;i<galImgs.length;i++) if(galImgs[i].name===name) return i;
+  return -1;
+}
+function galSelectAll(){ galImgs.forEach((im,i)=>{ galSel.add(im.name); _galPaint(i); }); galUpdateBar(); }
+function galClearSel(){ galSel.clear(); document.querySelectorAll('.gtile.sel').forEach(t=>t.classList.remove('sel')); galUpdateBar(); }
+function galUpdateBar(){
+  const n=galSel.size;
+  document.getElementById('galselinfo').textContent=n?(n+' selected'):'';
+  document.getElementById('galdel').disabled=!n;
+  document.getElementById('galclear').style.display=n?'':'none';
+}
+async function galDeleteSelected(){
+  const names=[...galSel];
+  if(!names.length) return;
+  if(!(await appConfirm('Delete '+names.length+' selected image'+(names.length===1?'':'s')
+      +' and their labels from disk?\\nThis cannot be undone.',
+      {title:'Delete images', ok:'Delete '+names.length, danger:true}))) return;
+  try{
+    const r=await fetch('/api/delete_many',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({names})}).then(r=>r.json());
+    if(r.error){ setStatus('error: '+r.error); return; }
+    setStatus('deleted '+r.deleted+' image'+(r.deleted===1?'':'s'));
+    galSel.clear();
+    // refresh the gallery and the editor's image list
+    const g=await fetch('/api/gallery?t='+Date.now()).then(r=>r.json());
+    galImgs=g.images||[]; count=g.count;
+    renderGallery();
+    if(count){ if(idx>=count) idx=count-1; load(idx); }
+    else { name=''; boxes=[]; origBoxes=[]; sel=-1; updateName(); }
+  }catch(e){ setStatus('delete request failed'); }
 }
 
 // delete the current image (and its label) from disk, then advance
